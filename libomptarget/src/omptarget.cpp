@@ -25,10 +25,11 @@
 #include <vector>
 
 // Header file global to this project
+//#define OMPTARGET_DEBUG
 #include "omptarget.h"
 
 #ifdef OMPTARGET_DEBUG
-static int DebugLevel = 0;
+static int DebugLevel = 1;
 
 #define DP(...) \
   do { \
@@ -162,7 +163,10 @@ struct DeviceTy {
   long getMapEntryRefCnt(void *HstPtrBegin);
   LookupResult lookupMapping(void *HstPtrBegin, int64_t Size);
   void *getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase, int64_t Size,
-      bool &IsNew, bool IsImplicit, bool UpdateRefCount = true);
+      //bool &IsNew, bool IsImplicit, bool UpdateRefCount = true);
+      // lld: uvm
+      bool &IsNew, bool IsImplicit, bool UpdateRefCount = true,
+      bool UVM = false);
   void *getTgtPtrBegin(void *HstPtrBegin, int64_t Size);
   void *getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
       bool UpdateRefCount);
@@ -856,7 +860,10 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
 // If NULL is returned, then either data allocation failed or the user tried
 // to do an illegal mapping.
 void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
-    int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount) {
+    //int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount) {
+    // lld: uvm
+    int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount,
+    bool UVM) {
   void *rc = NULL;
   DataMapMtx.lock();
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
@@ -884,7 +891,13 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
   } else if (Size) {
     // If it is not contained and Size > 0 we should create a new entry for it.
     IsNew = true;
-    uintptr_t tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+    //uintptr_t tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+    // lld: uvm
+    uintptr_t tp;
+    if (UVM)
+      tp = (uintptr_t)HstPtrBegin;
+    else
+      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
         DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
@@ -955,7 +968,10 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
       assert(HT.RefCount == 0 && "did not expect a negative ref count");
       DP("Deleting tgt data " DPxMOD " of size %ld\n",
           DPxPTR(HT.TgtPtrBegin), Size);
-      RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+      //RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+      // lld: for unified memory
+      if (HT.TgtPtrBegin != HT.HstPtrBegin)
+        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
           DPxPTR(HT.HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
@@ -1467,6 +1483,7 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
     if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       DP("Has a pointer entry: \n");
       // base is address of pointer.
+      // lld: FIXME cannot deal with this case now
       Pointer_TgtPtrBegin = Device.getOrAllocTgtPtr(HstPtrBase, HstPtrBase,
           sizeof(void *), Pointer_IsNew, IsImplicit, UpdateRef);
       if (!Pointer_TgtPtrBegin) {
@@ -1482,8 +1499,12 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
       UpdateRef = true; // subsequently update ref count of pointee
     }
 
+    //void *TgtPtrBegin = Device.getOrAllocTgtPtr(HstPtrBegin, HstPtrBase,
+    //    data_size, IsNew, IsImplicit, UpdateRef);
+    // lld: uvm
+    bool UVM = arg_types[i] & OMP_TGT_MAPTYPE_UVM;
     void *TgtPtrBegin = Device.getOrAllocTgtPtr(HstPtrBegin, HstPtrBase,
-        data_size, IsNew, IsImplicit, UpdateRef);
+        data_size, IsNew, IsImplicit, UpdateRef, UVM);
     if (!TgtPtrBegin && data_size) {
       // If data_size==0, then the argument could be a zero-length pointer to
       // NULL, so getOrAlloc() returning NULL is not an error.
@@ -1518,7 +1539,11 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
       if (copy) {
         DP("Moving %" PRId64 " bytes (hst:" DPxMOD ") -> (tgt:" DPxMOD ")\n",
             data_size, DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin));
-        int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, data_size);
+        //int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, data_size);
+        // lld: uvm
+        int rt = OFFLOAD_SUCCESS;
+        if (TgtPtrBegin != HstPtrBegin)
+          rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, data_size);
         if (rt != OFFLOAD_SUCCESS) {
           DP("Copying data to device failed.\n");
           rc = OFFLOAD_FAIL;
@@ -1660,7 +1685,11 @@ static int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
         if (DelEntry || Always || CopyMember) {
           DP("Moving %" PRId64 " bytes (tgt:" DPxMOD ") -> (hst:" DPxMOD ")\n",
               data_size, DPxPTR(TgtPtrBegin), DPxPTR(HstPtrBegin));
-          int rt = Device.data_retrieve(HstPtrBegin, TgtPtrBegin, data_size);
+          //int rt = Device.data_retrieve(HstPtrBegin, TgtPtrBegin, data_size);
+          // lld: uvm
+          int rt = OFFLOAD_SUCCESS;
+          if (HstPtrBegin != TgtPtrBegin)
+            rt = Device.data_retrieve(HstPtrBegin, TgtPtrBegin, data_size);
           if (rt != OFFLOAD_SUCCESS) {
             DP("Copying data from device failed.\n");
             rc = OFFLOAD_FAIL;
@@ -1797,7 +1826,10 @@ EXTERN void __tgt_target_data_update(int64_t device_id, int32_t arg_num,
     if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
       DP("Moving %" PRId64 " bytes (tgt:" DPxMOD ") -> (hst:" DPxMOD ")\n",
           arg_sizes[i], DPxPTR(TgtPtrBegin), DPxPTR(HstPtrBegin));
-      Device.data_retrieve(HstPtrBegin, TgtPtrBegin, MapSize);
+      //Device.data_retrieve(HstPtrBegin, TgtPtrBegin, MapSize);
+      // lld: uvm
+      if (HstPtrBegin != TgtPtrBegin)
+        Device.data_retrieve(HstPtrBegin, TgtPtrBegin, MapSize);
 
       uintptr_t lb = (uintptr_t) HstPtrBegin;
       uintptr_t ub = (uintptr_t) HstPtrBegin + MapSize;
@@ -1820,7 +1852,10 @@ EXTERN void __tgt_target_data_update(int64_t device_id, int32_t arg_num,
     if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
       DP("Moving %" PRId64 " bytes (hst:" DPxMOD ") -> (tgt:" DPxMOD ")\n",
           arg_sizes[i], DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin));
-      Device.data_submit(TgtPtrBegin, HstPtrBegin, MapSize);
+      //Device.data_submit(TgtPtrBegin, HstPtrBegin, MapSize);
+      // lld: for unified memory
+      if (TgtPtrBegin != HstPtrBegin)
+        Device.data_submit(TgtPtrBegin, HstPtrBegin, MapSize);
 
       uintptr_t lb = (uintptr_t) HstPtrBegin;
       uintptr_t ub = (uintptr_t) HstPtrBegin + MapSize;
@@ -1972,6 +2007,7 @@ static int target(int64_t device_id, void *host_ptr, int32_t arg_num,
 #endif
         // If first-private, copy data from host
         if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
+          // lld: this is required for private
           int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, arg_sizes[i]);
           if (rt != OFFLOAD_SUCCESS) {
             DP ("Copying data to device failed.\n");
@@ -2028,6 +2064,7 @@ static int target(int64_t device_id, void *host_ptr, int32_t arg_num,
 
   // Deallocate (first-)private arrays
   for (auto it : fpArrays) {
+    // lld: no need for modification since data is always allocated for private
     int rt = Device.RTL->data_delete(Device.RTLDeviceID, it);
     if (rt != OFFLOAD_SUCCESS) {
       DP("Deallocation of (first-)private arrays failed.\n");
