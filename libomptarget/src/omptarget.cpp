@@ -166,7 +166,7 @@ struct DeviceTy {
       //bool &IsNew, bool IsImplicit, bool UpdateRefCount = true);
       // lld: uvm
       bool &IsNew, bool IsImplicit, bool UpdateRefCount = true,
-      bool UVM = false);
+      bool UVM = false, bool PinHst = false);
   void *getTgtPtrBegin(void *HstPtrBegin, int64_t Size);
   void *getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
       bool UpdateRefCount);
@@ -863,7 +863,7 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     //int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount) {
     // lld: uvm
     int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount,
-    bool UVM) {
+    bool UVM, bool PinHost) {
   void *rc = NULL;
   DataMapMtx.lock();
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
@@ -896,7 +896,10 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     uintptr_t tp;
     if (UVM)
       tp = (uintptr_t)HstPtrBegin;
-    else
+    else if (PinHost) {
+      tp = (uintptr_t)HstPtrBegin;
+      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+    } else
       tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
@@ -1540,8 +1543,9 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
     //    data_size, IsNew, IsImplicit, UpdateRef);
     // lld: uvm
     bool UVM = arg_types[i] & OMP_TGT_MAPTYPE_UVM;
+    bool PinHost = arg_types[i] & OMP_TGT_MAPTYPE_HOST;
     void *TgtPtrBegin = Device.getOrAllocTgtPtr(HstPtrBegin, HstPtrBase,
-        data_size, IsNew, IsImplicit, UpdateRef, UVM);
+        data_size, IsNew, IsImplicit, UpdateRef, UVM, PinHost);
     if (!TgtPtrBegin && data_size) {
       // If data_size==0, then the argument could be a zero-length pointer to
       // NULL, so getOrAlloc() returning NULL is not an error.
