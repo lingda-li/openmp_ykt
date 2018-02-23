@@ -1439,11 +1439,31 @@ static int member_of(int64_t type) {
   return ((type & OMP_TGT_MAPTYPE_MEMBER_OF) >> 48) - 1;
 }
 
+// lld: compare rank
+bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
+  return (A.second < B.second);
+}
+
+// lld: decide mapping based on rank
+void target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types) {
+  std::vector<std::pair<int32_t, int64_t>> argList;
+  for (int32_t i = 0; i < arg_num; ++i) {
+    if (!(arg_types[i] & OMP_TGT_MAPTYPE_RANK))
+      continue;
+    unsigned Rank = (arg_types[i] & OMP_TGT_MAPTYPE_RANK) >> 12;
+    argList.push_back(std::make_pair(i, Rank));
+  }
+  std::sort(argList.begin(), argList.end(), compareRank)
+    arg_types[i] |= OMP_TGT_MAPTYPE_UVM;
+}
+
 /// Internal function to do the mapping and transfer the data to the device
 static int target_data_begin(DeviceTy &Device, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
   // process each input.
   int rc = OFFLOAD_SUCCESS;
+  // lld: decide uvm mapping
+  target_uvm_data_mapping_opt(arg_num, arg_sizes, arg_types);
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
