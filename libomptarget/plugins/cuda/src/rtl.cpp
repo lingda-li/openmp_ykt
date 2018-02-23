@@ -531,6 +531,13 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
   return DeviceInfo.getOffloadEntriesTable(device_id);
 }
 
+// lld: host data pinning
+void __tgt_rtl_data_pin(int32_t device_id, int64_t size, void *hst_ptr) {
+  if (size == 0)
+    return;
+  cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, cudaCpuDeviceId);
+}
+
 void *__tgt_rtl_data_alloc(int32_t device_id, int64_t size, void *hst_ptr) {
   if (size == 0) {
     return NULL;

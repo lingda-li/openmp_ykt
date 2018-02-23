@@ -166,7 +166,7 @@ struct DeviceTy {
       //bool &IsNew, bool IsImplicit, bool UpdateRefCount = true);
       // lld: uvm
       bool &IsNew, bool IsImplicit, bool UpdateRefCount = true,
-      bool UVM = false, bool PinHst = false);
+      bool UVM = false, bool PinHost = false);
   void *getTgtPtrBegin(void *HstPtrBegin, int64_t Size);
   void *getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
       bool UpdateRefCount);
@@ -201,6 +201,7 @@ struct RTLInfoTy {
   typedef int32_t(number_of_devices_ty)();
   typedef int32_t(init_device_ty)(int32_t);
   typedef __tgt_target_table *(load_binary_ty)(int32_t, void *);
+  typedef void (data_pin_ty)(int32_t, int64_t, void *);
   typedef void *(data_alloc_ty)(int32_t, int64_t, void *);
   typedef int32_t(data_submit_ty)(int32_t, void *, void *, int64_t);
   typedef int32_t(data_retrieve_ty)(int32_t, void *, void *, int64_t);
@@ -228,6 +229,7 @@ struct RTLInfoTy {
   number_of_devices_ty *number_of_devices;
   init_device_ty *init_device;
   load_binary_ty *load_binary;
+  data_pin_ty *data_pin; // lld
   data_alloc_ty *data_alloc;
   data_submit_ty *data_submit;
   data_retrieve_ty *data_retrieve;
@@ -251,7 +253,8 @@ struct RTLInfoTy {
         RTLName(),
 #endif
         is_valid_binary(0), number_of_devices(0), init_device(0),
-        load_binary(0), data_alloc(0), data_submit(0), data_retrieve(0),
+        //load_binary(0), data_alloc(0), data_submit(0), data_retrieve(0),
+        load_binary(0), data_pin(0), data_alloc(0), data_submit(0), data_retrieve(0), // lld
         data_delete(0), run_region(0), run_team_region(0), isUsed(false),
         Mtx() {}
 
@@ -267,6 +270,7 @@ struct RTLInfoTy {
     number_of_devices = r.number_of_devices;
     init_device = r.init_device;
     load_binary = r.load_binary;
+    data_pin = r.data_pin; // lld
     data_alloc = r.data_alloc;
     data_submit = r.data_submit;
     data_retrieve = r.data_retrieve;
@@ -351,6 +355,12 @@ void RTLsTy::LoadRTLs() {
     if (!(*((void**) &R.load_binary) = dlsym(
               dynlib_handle, "__tgt_rtl_load_binary")))
       continue;
+  DP("Hi!\n");
+    // lld
+    if (!(*((void**) &R.data_pin) = dlsym(
+              dynlib_handle, "__tgt_rtl_data_pin")))
+      continue;
+  DP("Hi!\n");
     if (!(*((void**) &R.data_alloc) = dlsym(
               dynlib_handle, "__tgt_rtl_data_alloc")))
       continue;
@@ -898,7 +908,7 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
       tp = (uintptr_t)HstPtrBegin;
     else if (PinHost) {
       tp = (uintptr_t)HstPtrBegin;
-      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+      RTL->data_pin(RTLDeviceID, Size, HstPtrBegin);
     } else
       tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
@@ -1468,10 +1478,11 @@ int64_t *target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_
     total_size += arg_sizes[idx];
     //if (total_size < 14 * 1024 * 1024 * 1024L) {
     if (total_size < 1 * 1024 * 1024 * 1024L) {
-      DP("lld Arg %" PRId64 " is mapped to device\n", idx);
+      DP("lld Arg %" PRId32 " is mapped to device\n", idx);
     } else {
-      DP("lld Arg %" PRId64 " is mapped to UM\n", idx);
-      new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+      DP("lld Arg %" PRId32 " is mapped to UM\n", idx);
+      //new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
     }
   }
   return new_arg_types;
