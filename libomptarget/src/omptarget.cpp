@@ -25,7 +25,7 @@
 #include <vector>
 
 // Header file global to this project
-//#define OMPTARGET_DEBUG
+#define OMPTARGET_DEBUG
 #include "omptarget.h"
 
 #ifdef OMPTARGET_DEBUG
@@ -1445,16 +1445,35 @@ bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
 }
 
 // lld: decide mapping based on rank
-void target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types) {
+int64_t *target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types) {
   std::vector<std::pair<int32_t, int64_t>> argList;
+  int64_t *new_arg_types = (int64_t*)malloc(sizeof(int64_t)*arg_num);
   for (int32_t i = 0; i < arg_num; ++i) {
+    if (arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT)
+      continue;
     if (!(arg_types[i] & OMP_TGT_MAPTYPE_RANK))
       continue;
     unsigned Rank = (arg_types[i] & OMP_TGT_MAPTYPE_RANK) >> 12;
     argList.push_back(std::make_pair(i, Rank));
+    new_arg_types[i] = arg_types[i];
   }
-  std::sort(argList.begin(), argList.end(), compareRank)
-    arg_types[i] |= OMP_TGT_MAPTYPE_UVM;
+  std::sort(argList.begin(), argList.end(), compareRank);
+  int64_t total_size = 0;
+  for (auto I : argList) {
+    int32_t idx = I.first;
+    total_size += arg_sizes[idx];
+    //if (total_size < 14 * 1024 * 1024 * 1024L) {
+    if (total_size < 9 * 1024 * 1024 * 1024L) {
+      //DEBUGP("lld", "Arg " PRId64 " is mapped to device\n", idx);
+      DP("lld Arg %" PRId64 " is mapped to device\n", idx);
+    } else {
+      //DEBUGP("lld", "Arg " PRId64 " is mapped to UM\n", idx);
+      DP("lld Arg %" PRId64 " is mapped to UM\n", idx);
+      //new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+    }
+  }
+  DP("lld map done\n");
+  return arg_types;
 }
 
 /// Internal function to do the mapping and transfer the data to the device
@@ -1463,7 +1482,7 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
   // process each input.
   int rc = OFFLOAD_SUCCESS;
   // lld: decide uvm mapping
-  target_uvm_data_mapping_opt(arg_num, arg_sizes, arg_types);
+  //arg_types = target_uvm_data_mapping_opt(arg_num, arg_sizes, arg_types);
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
