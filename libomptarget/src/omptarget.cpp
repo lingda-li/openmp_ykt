@@ -25,7 +25,7 @@
 #include <vector>
 
 // Header file global to this project
-#define OMPTARGET_DEBUG
+//#define OMPTARGET_DEBUG
 #include "omptarget.h"
 
 #ifdef OMPTARGET_DEBUG
@@ -355,12 +355,10 @@ void RTLsTy::LoadRTLs() {
     if (!(*((void**) &R.load_binary) = dlsym(
               dynlib_handle, "__tgt_rtl_load_binary")))
       continue;
-  DP("Hi!\n");
     // lld
     if (!(*((void**) &R.data_pin) = dlsym(
               dynlib_handle, "__tgt_rtl_data_pin")))
       continue;
-  DP("Hi!\n");
     if (!(*((void**) &R.data_alloc) = dlsym(
               dynlib_handle, "__tgt_rtl_data_alloc")))
       continue;
@@ -1481,8 +1479,8 @@ int64_t *target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_
       DP("lld Arg %" PRId32 " is mapped to device\n", idx);
     } else {
       DP("lld Arg %" PRId32 " is mapped to UM\n", idx);
-      //new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+      //new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
     }
   }
   return new_arg_types;
