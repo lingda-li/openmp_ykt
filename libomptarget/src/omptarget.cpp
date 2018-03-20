@@ -28,6 +28,25 @@
 //#define OMPTARGET_DEBUG
 #include "omptarget.h"
 
+// lld: debug print
+#define LLD_DEBUG
+#ifdef LLD_DEBUG
+#include <stdio.h>
+#define LLD_DP(...)                                                    \
+  {                                                                            \
+    fprintf(stderr, "Libomptarget --> ");                                        \
+    fprintf(stderr, __VA_ARGS__);                                              \
+  }
+
+#include <inttypes.h>
+#ifndef DPxMOD
+#define DPxMOD "0x%0*" PRIxPTR
+#endif
+#ifndef DPxPTR
+#define DPxPTR(ptr) ((int)(2*sizeof(uintptr_t))), ((uintptr_t) (ptr))
+#endif
+#endif
+
 #ifdef OMPTARGET_DEBUG
 static int DebugLevel = 1;
 
@@ -129,6 +148,9 @@ struct DeviceTy {
   std::mutex DataMapMtx, PendingGlobalsMtx, ShadowMtx;
 
   uint64_t loopTripCnt;
+  // lld: memory management
+  uint64_t deviceSize;
+  uint64_t umSize;
 
   DeviceTy(RTLInfoTy *RTL)
       : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), IsInit(false), InitFlag(),
@@ -902,13 +924,16 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     //uintptr_t tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     // lld: uvm
     uintptr_t tp;
-    if (UVM)
+    if (UVM) {
       tp = (uintptr_t)HstPtrBegin;
-    else if (PinHost) {
+      umSize += Size;
+    } else if (PinHost) {
       tp = (uintptr_t)HstPtrBegin;
       RTL->data_pin(RTLDeviceID, Size, HstPtrBegin);
-    } else
+    } else {
       tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+      deviceSize += Size;
+    }
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
         DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
@@ -981,8 +1006,10 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
           DPxPTR(HT.TgtPtrBegin), Size);
       //RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
       // lld: for unified memory
-      if (HT.TgtPtrBegin != HT.HstPtrBegin)
+      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
+        deviceSize -= Size;
         RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+      }
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
           DPxPTR(HT.HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
@@ -1005,6 +1032,9 @@ void DeviceTy::init() {
   if (rc == OFFLOAD_SUCCESS) {
     IsInit = true;
   }
+  // lld: memory management
+  deviceSize = 0;
+  umSize = 0;
 }
 
 /// Thread-safe method to initialize the device only once.
@@ -1456,9 +1486,13 @@ bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
 }
 
 // lld: decide mapping based on rank
-int64_t *target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types) {
+int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types) {
+  for (int i=0; i<arg_num; ++i) {
+    LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
+        ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
+        arg_sizes[i], arg_types[i]);
+  }
   std::vector<std::pair<int32_t, int64_t>> argList;
-  // FIXME: memory leak
   int64_t *new_arg_types = (int64_t*)malloc(sizeof(int64_t)*arg_num);
   for (int32_t i = 0; i < arg_num; ++i) {
     new_arg_types[i] = arg_types[i];
@@ -1470,19 +1504,23 @@ int64_t *target_uvm_data_mapping_opt(int32_t arg_num, int64_t *arg_sizes, int64_
     argList.push_back(std::make_pair(i, Rank));
   }
   std::sort(argList.begin(), argList.end(), compareRank);
-  int64_t total_size = 0;
+  int64_t used_dev_size = Device.deviceSize;
   for (auto I : argList) {
     int32_t idx = I.first;
-    total_size += arg_sizes[idx];
-    //if (total_size < 14 * 1024 * 1024 * 1024L) {
-    if (total_size < 1 * 1024 * 1024 * 1024L) {
-      DP("lld Arg %" PRId32 " is mapped to device\n", idx);
+    uint64_t total_dev_size = 1 * 1024 * 1024 * 1024L;
+    if (used_dev_size + (uint64_t)arg_sizes[idx] < total_dev_size) {
+      LLD_DP("lld Arg %d is mapped to device\n", idx);
+      used_dev_size += arg_sizes[idx];
     } else {
-      DP("lld Arg %" PRId32 " is mapped to UM\n", idx);
+      LLD_DP("lld Arg %d is mapped to UM\n", idx);
       new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
       //new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
     }
   }
+  uint64_t ltc = Device.loopTripCnt;
+  LLD_DP("lld loopcount: %lu\n", ltc);
+  LLD_DP("lld device size: %lu\n", Device.deviceSize);
+  LLD_DP("lld um size: %lu\n", Device.umSize);
   return new_arg_types;
 }
 
@@ -1492,7 +1530,7 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
   // process each input.
   int rc = OFFLOAD_SUCCESS;
   // lld: decide uvm mapping
-  arg_types = target_uvm_data_mapping_opt(arg_num, arg_sizes, arg_types);
+  arg_types = target_uvm_data_mapping_opt(Device, args_base, args, arg_num, arg_sizes, arg_types);
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
@@ -1620,6 +1658,8 @@ static int target_data_begin(DeviceTy &Device, int32_t arg_num,
     }
   }
 
+  // lld: uvm
+  free(arg_types);
   return rc;
 }
 
