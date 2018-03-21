@@ -521,6 +521,20 @@ EXTERN void *omp_target_alloc(size_t size, int device_num) {
     DP("omp_target_alloc returns host ptr " DPxMOD "\n", DPxPTR(rc));
     return rc;
   }
+  
+  // lld: uvm
+  if (device_num == -100) {
+    device_num = omp_get_default_device();
+    if (!device_is_ready(device_num)) {
+      DP("omp_target_alloc returns NULL ptr\n");
+      return NULL;
+    }
+    DeviceTy &Device = Devices[device_num];
+    int32_t device_id = -Device.RTLDeviceID - 1;
+    rc = Device.RTL->data_alloc(device_id, size, NULL);
+    DP("omp_target_alloc returns uvm ptr " DPxMOD "\n", DPxPTR(rc));
+    return rc;
+  }
 
   if (!device_is_ready(device_num)) {
     DP("omp_target_alloc returns NULL ptr\n");

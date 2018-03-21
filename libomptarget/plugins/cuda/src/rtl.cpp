@@ -543,6 +543,26 @@ void *__tgt_rtl_data_alloc(int32_t device_id, int64_t size, void *hst_ptr) {
     return NULL;
   }
 
+  // lld: uvm
+  if (device_id < 0) {
+    device_id = -device_id - 1;
+    CUdeviceptr ptr;
+    CUresult err = cuCtxSetCurrent(DeviceInfo.Contexts[device_id]);
+    if (err != CUDA_SUCCESS) {
+      DP("Error while trying to set CUDA current context\n");
+      CUDA_ERR_STRING(err);
+      return NULL;
+    }
+    err = cuMemAllocManaged(&ptr, size, CU_MEM_ATTACH_GLOBAL);
+    if (err != CUDA_SUCCESS) {
+      DP("Error while trying to allocate %d\n", err);
+      CUDA_ERR_STRING(err);
+      return NULL;
+    }
+    void *vptr = (void *)ptr;
+    return vptr;
+  }
+
   // Set the context we are using.
   CUresult err = cuCtxSetCurrent(DeviceInfo.Contexts[device_id]);
   if (err != CUDA_SUCCESS) {
