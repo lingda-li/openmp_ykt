@@ -1565,7 +1565,7 @@ int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **
         } else
           LLD_DP("lld Arg %d is mapped to device\n", idx);
       }
-      used_dev_size += arg_sizes[idx];
+      used_dev_size += DataSize;
     } else {
       LLD_DP("lld Arg %d is mapped to host\n", idx);
       new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
