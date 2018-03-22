@@ -54,6 +54,8 @@ enum tgt_map_type {
   OMP_TGT_MAPTYPE_HOST            = 0x800,
   // lld: ranking number
   OMP_TGT_MAPTYPE_RANK            = 0xff000,
+  // lld: local reuse
+  OMP_TGT_MAPTYPE_LOCAL_REUSE     = 0xff00000,
   // member of struct, member given by 4 MSBs - 1
   OMP_TGT_MAPTYPE_MEMBER_OF       = 0xffff000000000000
 };

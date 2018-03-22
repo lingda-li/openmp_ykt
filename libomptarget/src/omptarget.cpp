@@ -87,6 +87,9 @@ struct HostDataToTargetTy {
 
   uintptr_t TgtPtrBegin; // target info.
 
+  // lld: whether data mapping is decided
+  bool Decided = true;
+
   long RefCount;
 
   HostDataToTargetTy()
@@ -921,6 +924,22 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     if (UpdateRefCount)
       ++HT.RefCount;
 
+    // lld: delay decision
+    if (!HT.Decided) {
+      assert(!PinHost);
+      if (UVM && PinHost) { // delay decision
+      } else if (UVM) {
+        HT.TgtPtrBegin = (uintptr_t)HstPtrBegin;
+        umSize += Size;
+        HT.Decided = true;
+        IsNew = true;
+      } else {
+        HT.TgtPtrBegin = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+        deviceSize += Size;
+        HT.Decided = true;
+        IsNew = true;
+      }
+    }
     uintptr_t tp = HT.TgtPtrBegin + ((uintptr_t)HstPtrBegin - HT.HstPtrBegin);
     DP("Mapping exists%s with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD ", "
         "Size=%ld,%s RefCount=%s\n", (IsImplicit ? " (implicit)" : ""),
@@ -938,7 +957,10 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     //uintptr_t tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     // lld: uvm
     uintptr_t tp;
-    if (UVM) {
+    if (UVM && PinHost) { // delay decision
+      tp = (uintptr_t)HstPtrBegin;
+      IsNew = false;
+    } else if (UVM) {
       tp = (uintptr_t)HstPtrBegin;
       umSize += Size;
     } else if (PinHost) {
@@ -951,8 +973,12 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
         DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
-    HostDataToTargetMap.push_front(HostDataToTargetTy((uintptr_t)HstPtrBase,
-        (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp));
+    HostDataToTargetTy DataEntry = HostDataToTargetTy((uintptr_t)HstPtrBase,
+        (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp);
+    // lld: delay decision
+    if (UVM && PinHost)
+      DataEntry.Decided = false;
+    HostDataToTargetMap.push_front(DataEntry);
     rc = (void *)tp;
   }
 
@@ -1500,7 +1526,7 @@ bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
 }
 
 // lld: decide mapping based on rank
-int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types) {
+int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types, bool data_region) {
   for (int i=0; i<arg_num; ++i) {
     LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
         ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
@@ -1510,28 +1536,41 @@ int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **
   int64_t *new_arg_types = (int64_t*)malloc(sizeof(int64_t)*arg_num);
   for (int32_t i = 0; i < arg_num; ++i) {
     new_arg_types[i] = arg_types[i];
-    if (arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT)
-      continue;
+    //if (arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT)
+    //  continue;
     if (!(arg_types[i] & OMP_TGT_MAPTYPE_RANK))
       continue;
     unsigned Rank = (arg_types[i] & OMP_TGT_MAPTYPE_RANK) >> 12;
     argList.push_back(std::make_pair(i, Rank));
   }
   std::sort(argList.begin(), argList.end(), compareRank);
-  int64_t used_dev_size = Device.deviceSize;
+  int64_t used_dev_size = Device.deviceSize + Device.umSize;
+  uint64_t ltc = Device.loopTripCnt;
   for (auto I : argList) {
     int32_t idx = I.first;
+    uint64_t DataSize = arg_sizes[idx];
     uint64_t total_dev_size = 1 * 1024 * 1024 * 1024L;
-    if (used_dev_size + (uint64_t)arg_sizes[idx] < total_dev_size) {
-      LLD_DP("lld Arg %d is mapped to device\n", idx);
+    unsigned LocalReuse = (arg_types[idx] & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
+    if (used_dev_size + DataSize < total_dev_size) {
+      if (data_region) {
+        LLD_DP("lld Arg %d mapping is not decided\n", idx);
+        new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+        new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+      } else {
+        double LocalReuseFloat = (double)LocalReuse / 16.0;
+        double Density = LocalReuseFloat * ltc / DataSize;
+        if (Density < 0.6) {
+          LLD_DP("lld Arg %d is mapped to UM\n", idx);
+          new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+        } else
+          LLD_DP("lld Arg %d is mapped to device\n", idx);
+      }
       used_dev_size += arg_sizes[idx];
     } else {
-      LLD_DP("lld Arg %d is mapped to UM\n", idx);
-      new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-      //new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+      LLD_DP("lld Arg %d is mapped to host\n", idx);
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
     }
   }
-  uint64_t ltc = Device.loopTripCnt;
   LLD_DP("lld loopcount: %lu\n", ltc);
   LLD_DP("lld device size: %lu\n", Device.deviceSize);
   LLD_DP("lld um size: %lu\n", Device.umSize);
@@ -1540,11 +1579,13 @@ int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **
 
 /// Internal function to do the mapping and transfer the data to the device
 static int target_data_begin(DeviceTy &Device, int32_t arg_num,
-    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+    //void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+    // lld: target data region or not
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types, bool data_region) {
   // process each input.
   int rc = OFFLOAD_SUCCESS;
   // lld: decide uvm mapping
-  arg_types = target_uvm_data_mapping_opt(Device, args_base, args, arg_num, arg_sizes, arg_types);
+  arg_types = target_uvm_data_mapping_opt(Device, args_base, args, arg_num, arg_sizes, arg_types, data_region);
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
@@ -1717,7 +1758,9 @@ EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
   }
 #endif
 
-  target_data_begin(Device, arg_num, args_base, args, arg_sizes, arg_types);
+  //target_data_begin(Device, arg_num, args_base, args, arg_sizes, arg_types);
+  // lld: target data region or not
+  target_data_begin(Device, arg_num, args_base, args, arg_sizes, arg_types, true);
 }
 
 /// Internal function to undo the mapping and retrieve the data from the device.
@@ -2057,7 +2100,9 @@ static int target(int64_t device_id, void *host_ptr, int32_t arg_num,
 
   // Move data to device.
   int rc = target_data_begin(Device, arg_num, args_base, args, arg_sizes,
-      arg_types);
+      //arg_types);
+      // lld: target data region or not
+      arg_types, false);
 
   if (rc != OFFLOAD_SUCCESS) {
     DP("Call to target_data_begin failed, skipping target execution.\n");
