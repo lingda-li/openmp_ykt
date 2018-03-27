@@ -926,18 +926,21 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
 
     // lld: delay decision
     if (!HT.Decided) {
-      assert(!PinHost);
+      Size = HT.HstPtrEnd - HT.HstPtrBegin;
       if (UVM && PinHost) { // delay decision
       } else if (UVM) {
         HT.TgtPtrBegin = (uintptr_t)HstPtrBegin;
         umSize += Size;
         HT.Decided = true;
         IsNew = true;
+        LLD_DP("lld Map " DPxMOD " to UM\n", DPxPTR(HstPtrBegin));
       } else {
+        assert(!PinHost);
         HT.TgtPtrBegin = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
         deviceSize += Size;
         HT.Decided = true;
         IsNew = true;
+        LLD_DP("lld Map " DPxMOD " to device (" DPxMOD ")\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin));
       }
     }
     uintptr_t tp = HT.TgtPtrBegin + ((uintptr_t)HstPtrBegin - HT.HstPtrBegin);
@@ -1549,6 +1552,12 @@ int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **
   for (auto I : argList) {
     int32_t idx = I.first;
     uint64_t DataSize = arg_sizes[idx];
+    LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
+    if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) {
+      DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
+    }
+    if (DataSize == 0)
+      continue;
     uint64_t total_dev_size = 1 * 1024 * 1024 * 1024L;
     unsigned LocalReuse = (arg_types[idx] & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
     if (used_dev_size + DataSize < total_dev_size) {
@@ -1560,10 +1569,10 @@ int64_t *target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **
         double LocalReuseFloat = (double)LocalReuse / 16.0;
         double Density = LocalReuseFloat * ltc / DataSize;
         if (Density < 0.6) {
-          LLD_DP("lld Arg %d is mapped to UM\n", idx);
+          LLD_DP("lld Arg %d is intended for UM\n", idx);
           new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
         } else
-          LLD_DP("lld Arg %d is mapped to device\n", idx);
+          LLD_DP("lld Arg %d is intended for device\n", idx);
       }
       used_dev_size += DataSize;
     } else {
