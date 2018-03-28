@@ -47,6 +47,9 @@
 #endif
 #endif
 
+// lld: GPU memory mode
+int GMode = 0;
+
 #ifdef OMPTARGET_DEBUG
 static int DebugLevel = 1;
 
@@ -341,6 +344,21 @@ void RTLsTy::LoadRTLs() {
   if (envStr && !strcmp(envStr, "DISABLED")) {
     DP("Target offloading disabled by environment\n");
     return;
+  }
+
+  // lld: parse environment variable LLD_GPU_MODE
+  envStr = getenv("LLD_GPU_MODE");
+  if (envStr) {
+    if (!strcmp(envStr, "UM")) {
+      GMode = 1;
+      LLD_DP("lld Set mode to UM\n");
+    } else if (!strcmp(envStr, "DEV")) {
+      GMode = 2;
+      LLD_DP("lld Set mode to DEV\n");
+    } else if (!strcmp(envStr, "HOST")) {
+      GMode = 3;
+      LLD_DP("lld Set mode to HOST\n");
+    }
   }
 
   DP("Loading RTLs...\n");
@@ -1542,13 +1560,13 @@ bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
 std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types, bool data_region) {
   int64_t used_dev_size = Device.deviceSize + Device.umSize;
   uint64_t ltc = Device.loopTripCnt;
-  uint64_t total_dev_size = 1 * 1024 * 1024 * 1024L;
+  uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
   LLD_DP("lld %s\t  loopcount: %lu\t  device: %lu\t  UM: %lu\n", (data_region ? "DATA" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
-  for (int i=0; i<arg_num; ++i) {
-    LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-        ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
-        arg_sizes[i], arg_types[i]);
-  }
+  //for (int i=0; i<arg_num; ++i) {
+  //  LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
+  //      ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
+  //      arg_sizes[i], arg_types[i]);
+  //}
   std::vector<std::pair<int32_t, int64_t>> argList;
   int64_t *new_arg_types = (int64_t*)malloc(sizeof(int64_t)*arg_num);
   int64_t *new_arg_sizes = (int64_t*)malloc(sizeof(int64_t)*arg_num);
@@ -1565,39 +1583,46 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
   std::sort(argList.begin(), argList.end(), compareRank);
   for (auto I : argList) {
     int32_t idx = I.first;
-    uint64_t DataSize = arg_sizes[idx];
-    LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
-    if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter)
-      DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
-    if (DataSize == 0)
-      continue;
-    if (lr.Entry == Device.HostDataToTargetMap.end() || !lr.Entry->Decided) {
-      if (lr.Entry != Device.HostDataToTargetMap.end()) {
-        // restore recorded maptype
-        new_arg_types[idx] &= ~0x3ff;
-        new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
-        // restore size
-        new_arg_sizes[idx] = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
-      }
-      unsigned LocalReuse = (arg_types[idx] & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
-      if (used_dev_size + DataSize < total_dev_size) {
-        if (data_region) {
-          LLD_DP("lld Arg %d mapping is not decided\n", idx);
-          new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-          new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
-        } else {
-          double LocalReuseFloat = (double)LocalReuse / 16.0;
-          double Density = LocalReuseFloat * ltc / DataSize;
-          if (Density < 0.6) {
-            LLD_DP("lld Arg %d is intended for UM\n", idx);
-            new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-          } else
-            LLD_DP("lld Arg %d is intended for device\n", idx);
+    if (GMode == 1) // UM mode
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+    else if (GMode == 2) { // DEV mode
+    } else if (GMode == 3) // HOST mode
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+    else { // Normal processing
+      uint64_t DataSize = arg_sizes[idx];
+      LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
+      if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter)
+        DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
+      if (DataSize == 0)
+        continue;
+      if (lr.Entry == Device.HostDataToTargetMap.end() || !lr.Entry->Decided) {
+        if (lr.Entry != Device.HostDataToTargetMap.end()) {
+          // restore recorded maptype
+          new_arg_types[idx] &= ~0x3ff;
+          new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
+          // restore size
+          new_arg_sizes[idx] = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
         }
-        used_dev_size += DataSize;
-      } else {
-        LLD_DP("lld Arg %d is mapped to host\n", idx);
-        new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+        unsigned LocalReuse = (arg_types[idx] & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
+        if (used_dev_size + DataSize < total_dev_size) {
+          if (data_region) {
+            LLD_DP("lld Arg %d mapping is not decided\n", idx);
+            new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+            new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+          } else {
+            double LocalReuseFloat = (double)LocalReuse / 16.0;
+            double Density = LocalReuseFloat * ltc / DataSize;
+            if (Density < 0.6) {
+              LLD_DP("lld Arg %d is intended for UM\n", idx);
+              new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+            } else
+              LLD_DP("lld Arg %d is intended for device\n", idx);
+          }
+          used_dev_size += DataSize;
+        } else {
+          LLD_DP("lld Arg %d is mapped to host\n", idx);
+          new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+        }
       }
     }
   }
