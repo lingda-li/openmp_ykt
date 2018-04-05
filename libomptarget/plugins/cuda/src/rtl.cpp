@@ -531,11 +531,28 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
   return DeviceInfo.getOffloadEntriesTable(device_id);
 }
 
-// lld: host data pinning
-void __tgt_rtl_data_pin(int32_t device_id, int64_t size, void *hst_ptr) {
+// lld: data optimization
+void __tgt_rtl_data_opt(int32_t device_id, int64_t size, void *hst_ptr, int32_t type) {
   if (size == 0)
     return;
-  cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, cudaCpuDeviceId);
+  LLD_DP("  Apply opt %d to " DPxMOD "\n", type, DPxPTR(hst_ptr));
+  CUresult err = CUDA_SUCCESS;
+  if (type == 0) // pin to host
+    err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CU_DEVICE_CPU);
+  else if (type == 1) // prefetch
+    err = cuMemPrefetchAsync((CUdeviceptr)hst_ptr, size, device_id, 0);
+  else if (type == 2) // map pages
+    err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_ACCESSED_BY, device_id);
+  else if (type == 3) // duplicate
+    err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_READ_MOSTLY, device_id);
+  else if (type == 4) // half pin to device
+    err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device_id);
+  else
+    LLD_DP("    Invalid optimization\n");
+  if (err != CUDA_SUCCESS) {
+    LLD_DP("Error optimization failed\n");
+    CUDA_ERR_STRING(err);
+  }
 }
 
 void *__tgt_rtl_data_alloc(int32_t device_id, int64_t size, void *hst_ptr) {
@@ -560,6 +577,7 @@ void *__tgt_rtl_data_alloc(int32_t device_id, int64_t size, void *hst_ptr) {
       return NULL;
     }
     void *vptr = (void *)ptr;
+    //void *vptr = malloc(size);
     return vptr;
   }
 

@@ -18,6 +18,25 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// lld: debug print
+#define LLD_DEBUG
+#ifdef LLD_DEBUG
+#include <stdio.h>
+#define LLD_DP(...)                                                    \
+  {                                                                            \
+    fprintf(stderr, "Libomptarget --> ");                                        \
+    fprintf(stderr, __VA_ARGS__);                                              \
+  }
+
+#include <inttypes.h>
+#ifndef DPxMOD
+#define DPxMOD "0x%0*" PRIxPTR
+#endif
+#ifndef DPxPTR
+#define DPxPTR(ptr) ((int)(2*sizeof(uintptr_t))), ((uintptr_t) (ptr))
+#endif
+#endif
+
 #define OFFLOAD_SUCCESS (0)
 #define OFFLOAD_FAIL (~0)
 
@@ -55,7 +74,7 @@ enum tgt_map_type {
   // lld: ranking number
   OMP_TGT_MAPTYPE_RANK            = 0xff000,
   // lld: local reuse
-  OMP_TGT_MAPTYPE_LOCAL_REUSE     = 0xff00000,
+  OMP_TGT_MAPTYPE_LOCAL_REUSE     = 0xfff00000,
   // member of struct, member given by 4 MSBs - 1
   OMP_TGT_MAPTYPE_MEMBER_OF       = 0xffff000000000000
 };

@@ -28,25 +28,6 @@
 //#define OMPTARGET_DEBUG
 #include "omptarget.h"
 
-// lld: debug print
-#define LLD_DEBUG
-#ifdef LLD_DEBUG
-#include <stdio.h>
-#define LLD_DP(...)                                                    \
-  {                                                                            \
-    fprintf(stderr, "Libomptarget --> ");                                        \
-    fprintf(stderr, __VA_ARGS__);                                              \
-  }
-
-#include <inttypes.h>
-#ifndef DPxMOD
-#define DPxMOD "0x%0*" PRIxPTR
-#endif
-#ifndef DPxPTR
-#define DPxPTR(ptr) ((int)(2*sizeof(uintptr_t))), ((uintptr_t) (ptr))
-#endif
-#endif
-
 // lld: GPU memory mode
 int GMode = 0;
 
@@ -230,7 +211,7 @@ struct RTLInfoTy {
   typedef int32_t(number_of_devices_ty)();
   typedef int32_t(init_device_ty)(int32_t);
   typedef __tgt_target_table *(load_binary_ty)(int32_t, void *);
-  typedef void (data_pin_ty)(int32_t, int64_t, void *);
+  typedef void (data_opt_ty)(int32_t, int64_t, void *, int32_t);
   typedef void *(data_alloc_ty)(int32_t, int64_t, void *);
   typedef int32_t(data_submit_ty)(int32_t, void *, void *, int64_t);
   typedef int32_t(data_retrieve_ty)(int32_t, void *, void *, int64_t);
@@ -258,7 +239,7 @@ struct RTLInfoTy {
   number_of_devices_ty *number_of_devices;
   init_device_ty *init_device;
   load_binary_ty *load_binary;
-  data_pin_ty *data_pin; // lld
+  data_opt_ty *data_opt; // lld
   data_alloc_ty *data_alloc;
   data_submit_ty *data_submit;
   data_retrieve_ty *data_retrieve;
@@ -283,7 +264,7 @@ struct RTLInfoTy {
 #endif
         is_valid_binary(0), number_of_devices(0), init_device(0),
         //load_binary(0), data_alloc(0), data_submit(0), data_retrieve(0),
-        load_binary(0), data_pin(0), data_alloc(0), data_submit(0), data_retrieve(0), // lld
+        load_binary(0), data_opt(0), data_alloc(0), data_submit(0), data_retrieve(0), // lld
         data_delete(0), run_region(0), run_team_region(0), isUsed(false),
         Mtx() {}
 
@@ -299,7 +280,7 @@ struct RTLInfoTy {
     number_of_devices = r.number_of_devices;
     init_device = r.init_device;
     load_binary = r.load_binary;
-    data_pin = r.data_pin; // lld
+    data_opt = r.data_opt; // lld
     data_alloc = r.data_alloc;
     data_submit = r.data_submit;
     data_retrieve = r.data_retrieve;
@@ -351,13 +332,13 @@ void RTLsTy::LoadRTLs() {
   if (envStr) {
     if (!strcmp(envStr, "UM")) {
       GMode = 1;
-      LLD_DP("lld Set mode to UM\n");
+      LLD_DP("Set mode to UM\n");
     } else if (!strcmp(envStr, "DEV")) {
       GMode = 2;
-      LLD_DP("lld Set mode to DEV\n");
+      LLD_DP("Set mode to DEV\n");
     } else if (!strcmp(envStr, "HOST")) {
       GMode = 3;
-      LLD_DP("lld Set mode to HOST\n");
+      LLD_DP("Set mode to HOST\n");
     }
   }
 
@@ -399,9 +380,9 @@ void RTLsTy::LoadRTLs() {
     if (!(*((void**) &R.load_binary) = dlsym(
               dynlib_handle, "__tgt_rtl_load_binary")))
       continue;
-    // lld
-    if (!(*((void**) &R.data_pin) = dlsym(
-              dynlib_handle, "__tgt_rtl_data_pin")))
+    // lld: data optimization interface
+    if (!(*((void**) &R.data_opt) = dlsym(
+              dynlib_handle, "__tgt_rtl_data_opt")))
       continue;
     if (!(*((void**) &R.data_alloc) = dlsym(
               dynlib_handle, "__tgt_rtl_data_alloc")))
@@ -554,7 +535,7 @@ EXTERN void *omp_target_alloc(size_t size, int device_num) {
     DeviceTy &Device = Devices[device_num];
     int32_t device_id = -Device.RTLDeviceID - 1;
     rc = Device.RTL->data_alloc(device_id, size, NULL);
-    DP("omp_target_alloc returns uvm ptr " DPxMOD "\n", DPxPTR(rc));
+    LLD_DP("omp_target_alloc returns uvm ptr " DPxMOD "\n", DPxPTR(rc));
     return rc;
   }
 
@@ -951,18 +932,21 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     if (!HT.Decided) {
       if (UVM && PinHost) { // delay decision
       } else if (UVM) {
+        LLD_DP("  Map " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
         HT.TgtPtrBegin = (uintptr_t)HstPtrBegin;
         umSize += Size;
         HT.Decided = true;
+        HT.MapType &= ~OMP_TGT_MAPTYPE_UVM;
+        //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
         IsNew = true;
-        LLD_DP("lld Map " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
       } else {
         assert(!PinHost);
+        LLD_DP("  Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
         HT.TgtPtrBegin = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
         deviceSize += Size;
         HT.Decided = true;
+        HT.MapType &= ~(OMP_TGT_MAPTYPE_UVM | OMP_TGT_MAPTYPE_HOST);
         IsNew = true;
-        LLD_DP("lld Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
       }
     }
     uintptr_t tp = HT.TgtPtrBegin + ((uintptr_t)HstPtrBegin - HT.HstPtrBegin);
@@ -986,16 +970,17 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
       tp = (uintptr_t)HstPtrBegin;
       IsNew = false;
     } else if (UVM) {
+      LLD_DP("  Map " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
       tp = (uintptr_t)HstPtrBegin;
       umSize += Size;
-      LLD_DP("lld Map " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
+      //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
     } else if (PinHost) {
       tp = (uintptr_t)HstPtrBegin;
-      RTL->data_pin(RTLDeviceID, Size, HstPtrBegin);
+      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 0);
     } else {
+      LLD_DP("  Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
       tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
       deviceSize += Size;
-      LLD_DP("lld Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
     }
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
@@ -1077,7 +1062,7 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
       if (HT.TgtPtrBegin != HT.HstPtrBegin) {
         deviceSize -= Size;
         RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
-        LLD_DP("lld Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
+        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
       }
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
@@ -1133,14 +1118,14 @@ __tgt_target_table *DeviceTy::load_binary(void *Img) {
 // Submit data to device.
 int32_t DeviceTy::data_submit(void *TgtPtrBegin, void *HstPtrBegin,
     int64_t Size) {
-  LLD_DP("lld Submit " DPxMOD " to " DPxMOD ", size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin), Size);
+  LLD_DP("  Submit " DPxMOD " to " DPxMOD ", size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin), Size);
   return RTL->data_submit(RTLDeviceID, TgtPtrBegin, HstPtrBegin, Size);
 }
 
 // Retrieve data from device.
 int32_t DeviceTy::data_retrieve(void *HstPtrBegin, void *TgtPtrBegin,
     int64_t Size) {
-  LLD_DP("lld Retrieve " DPxMOD " from " DPxMOD ", size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin), Size);
+  LLD_DP("  Retrieve " DPxMOD " from " DPxMOD ", size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(TgtPtrBegin), Size);
   return RTL->data_retrieve(RTLDeviceID, HstPtrBegin, TgtPtrBegin, Size);
 }
 
@@ -1561,7 +1546,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
   int64_t used_dev_size = Device.deviceSize + Device.umSize;
   uint64_t ltc = Device.loopTripCnt;
   uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
-  LLD_DP("lld %s\t  loopcount: %lu\t  device: %lu\t  UM: %lu\n", (data_region ? "DATA" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
+  LLD_DP("%s\t(#iter: %lu    device: %lu    UM: %lu)\n", (data_region ? "DATA\t" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
   //for (int i=0; i<arg_num; ++i) {
   //  LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
   //      ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
@@ -1606,23 +1591,26 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
         unsigned LocalReuse = (arg_types[idx] & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
         if (used_dev_size + DataSize < total_dev_size) {
           if (data_region) {
-            LLD_DP("lld Arg %d mapping is not decided\n", idx);
+            LLD_DP("  Arg %d mapping is not decided\n", idx);
             new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
             new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
           } else {
-            double LocalReuseFloat = (double)LocalReuse / 16.0;
+            double LocalReuseFloat = (double)LocalReuse / 8.0;
             double Density = LocalReuseFloat * ltc / DataSize;
             if (Density < 0.6) {
-              LLD_DP("lld Arg %d is intended for UM\n", idx);
+              LLD_DP("  Arg %d is intended for UM (%f)\n", idx, Density);
               new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
             } else
-              LLD_DP("lld Arg %d is intended for device\n", idx);
+              LLD_DP("  Arg %d is intended for device (%f)\n", idx, Density);
           }
           used_dev_size += DataSize;
         } else {
-          LLD_DP("lld Arg %d is mapped to host\n", idx);
+          LLD_DP("  Arg %d is mapped to host\n", idx);
           new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
         }
+        LLD_DP("  Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
+            ", Type=0x%" PRIx64 "\n", idx, DPxPTR(args_base[idx]), DPxPTR(args[idx]),
+            new_arg_sizes[idx], new_arg_types[idx]);
       }
     }
   }
