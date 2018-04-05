@@ -31,6 +31,9 @@
 // lld: GPU memory mode
 int GMode = 0;
 
+// lld: global time stamp
+uint64_t GlobalTimeStamp = 0;
+
 #ifdef OMPTARGET_DEBUG
 static int DebugLevel = 1;
 
@@ -74,6 +77,9 @@ struct HostDataToTargetTy {
   // lld: whether data mapping is decided
   bool Decided = true;
   int64_t MapType;
+  // lld: replacement info
+  uint64_t TimeStamp = 0;
+  bool IsValid = true;
 
   long RefCount;
 
@@ -96,6 +102,10 @@ struct LookupResult {
     unsigned IsContained   : 1;
     unsigned ExtendsBefore : 1;
     unsigned ExtendsAfter  : 1;
+    // lld: invalidated entry
+    unsigned InvalidContained       : 1;
+    unsigned InvalidExtendsB        : 1;
+    unsigned InvalidExtendsA        : 1;
   } Flags;
 
   HostDataToTargetListTy::iterator Entry;
@@ -535,7 +545,7 @@ EXTERN void *omp_target_alloc(size_t size, int device_num) {
     DeviceTy &Device = Devices[device_num];
     int32_t device_id = -Device.RTLDeviceID - 1;
     rc = Device.RTL->data_alloc(device_id, size, NULL);
-    LLD_DP("omp_target_alloc returns uvm ptr " DPxMOD "\n", DPxPTR(rc));
+    LLD_DP("omp_target_alloc returns uvm ptr " DPxMOD ", size=%ld\n", DPxPTR(rc), size);
     return rc;
   }
 
@@ -776,6 +786,8 @@ int DeviceTy::associatePtr(void *HstPtrBegin, void *TgtPtrBegin, int64_t Size) {
 
   // Check if entry exists
   for (auto &HT : HostDataToTargetMap) {
+    // lld: check validation
+    if (!HT.IsValid) continue;
     if ((uintptr_t)HstPtrBegin == HT.HstPtrBegin) {
       // Mapping already exists
       bool isValid = HT.HstPtrBegin == (uintptr_t) HstPtrBegin &&
@@ -822,6 +834,8 @@ int DeviceTy::disassociatePtr(void *HstPtrBegin) {
   // Check if entry exists
   for (HostDataToTargetListTy::iterator ii = HostDataToTargetMap.begin();
       ii != HostDataToTargetMap.end(); ++ii) {
+    // lld: check validation
+    if (!ii->IsValid) continue;
     if ((uintptr_t)HstPtrBegin == ii->HstPtrBegin) {
       // Mapping exists
       if (CONSIDERED_INF(ii->RefCount)) {
@@ -850,6 +864,8 @@ long DeviceTy::getMapEntryRefCnt(void *HstPtrBegin) {
 
   DataMapMtx.lock();
   for (auto &HT : HostDataToTargetMap) {
+    // lld: check validation
+    if (!HT.IsValid) continue;
     if (hp >= HT.HstPtrBegin && hp < HT.HstPtrEnd) {
       DP("DeviceTy::getMapEntry: requested entry found\n");
       RefCnt = HT.RefCount;
@@ -884,6 +900,15 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
 
     if (lr.Flags.IsContained || lr.Flags.ExtendsBefore ||
         lr.Flags.ExtendsAfter) {
+      // lld: check validation
+      if (!HT.IsValid) {
+        lr.Flags.InvalidContained = lr.Flags.IsContained;
+        lr.Flags.InvalidExtendsB = lr.Flags.ExtendsBefore;
+        lr.Flags.InvalidExtendsA = lr.Flags.ExtendsAfter;
+        lr.Flags.IsContained = 0;
+        lr.Flags.ExtendsBefore = 0;
+        lr.Flags.ExtendsAfter = 0;
+      }
       break;
     }
   }
@@ -960,6 +985,46 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
   } else if ((lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) && !IsImplicit) {
     // Explicit extension of mapped data - not allowed.
     DP("Explicit extension of mapping is not allowed.\n");
+  } else if (lr.Flags.InvalidContained ||
+      ((lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA) && IsImplicit)) { // lld: invalid
+    auto &HT = *lr.Entry;
+    IsNew = true;
+    assert(HT.Decided);
+
+    if (UpdateRefCount)
+      ++HT.RefCount;
+
+    HstPtrBegin = (void*)HT.HstPtrBegin;
+    Size = HT.HstPtrEnd - HT.HstPtrBegin;
+    uintptr_t tp;
+    if (UVM && PinHost) { // delay decision
+      tp = (uintptr_t)HstPtrBegin;
+      IsNew = false;
+    } else if (UVM) {
+      LLD_DP("  Remap " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
+      tp = (uintptr_t)HstPtrBegin;
+      umSize += Size;
+      //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
+    } else if (PinHost) {
+      tp = (uintptr_t)HstPtrBegin;
+      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 0);
+    } else {
+      LLD_DP("  Remap " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
+      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+      deviceSize += Size;
+    }
+    HT.IsValid = true;
+    HT.TgtPtrBegin = tp;
+    // lld: delay decision
+    if (UVM && PinHost)
+      HT.Decided = false;
+    HT.MapType = MapType;
+    // lld: replacement info
+    HT.TimeStamp = GlobalTimeStamp;
+    rc = (void *)tp;
+  } else if ((lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA) && !IsImplicit) { // lld: invalid
+    // Explicit extension of mapped data - not allowed.
+    LLD_DP("Explicit extension of mapping is not allowed.\n");
   } else if (Size) {
     // If it is not contained and Size > 0 we should create a new entry for it.
     IsNew = true;
@@ -991,6 +1056,8 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     if (UVM && PinHost)
       DataEntry.Decided = false;
     DataEntry.MapType = MapType;
+    // lld: replacement info
+    DataEntry.TimeStamp = GlobalTimeStamp;
     HostDataToTargetMap.push_front(DataEntry);
     rc = (void *)tp;
   }
@@ -1067,7 +1134,9 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
           DPxPTR(HT.HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-      HostDataToTargetMap.erase(lr.Entry);
+      //HostDataToTargetMap.erase(lr.Entry);
+      // lld: replacement
+      HT.IsValid = false;
     }
     rc = OFFLOAD_SUCCESS;
   } else {
@@ -1536,6 +1605,9 @@ static int member_of(int64_t type) {
   return ((type & OMP_TGT_MAPTYPE_MEMBER_OF) >> 48) - 1;
 }
 
+// lld: replacement
+#include "replacement.h"
+
 // lld: compare rank
 bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
   return (A.second < B.second);
@@ -1547,6 +1619,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
   uint64_t ltc = Device.loopTripCnt;
   uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
   LLD_DP("%s\t(#iter: %lu    device: %lu    UM: %lu)\n", (data_region ? "DATA\t" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
+  dumpTargetData(&Device.HostDataToTargetMap);
   //for (int i=0; i<arg_num; ++i) {
   //  LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
   //      ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
@@ -1580,7 +1653,8 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
         DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
       if (DataSize == 0)
         continue;
-      if (lr.Entry == Device.HostDataToTargetMap.end() || !lr.Entry->Decided) {
+      if (lr.Entry == Device.HostDataToTargetMap.end() ||
+          (!lr.Entry->Decided && lr.Entry->IsValid)) {
         if (lr.Entry != Device.HostDataToTargetMap.end()) {
           // restore recorded maptype
           new_arg_types[idx] &= ~0x3ff;
