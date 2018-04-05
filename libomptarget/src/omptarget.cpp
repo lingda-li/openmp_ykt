@@ -1001,17 +1001,32 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
       tp = (uintptr_t)HstPtrBegin;
       IsNew = false;
     } else if (UVM) {
+      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
+        deviceSize -= Size;
+        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
+      }
       LLD_DP("  Remap " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
       tp = (uintptr_t)HstPtrBegin;
       umSize += Size;
       //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
     } else if (PinHost) {
+      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
+        deviceSize -= Size;
+        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
+      }
       tp = (uintptr_t)HstPtrBegin;
       RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 0);
     } else {
-      LLD_DP("  Remap " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
-      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-      deviceSize += Size;
+      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
+        LLD_DP("  Reassociate " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
+        tp = HT.TgtPtrBegin;
+      } else {
+        LLD_DP("  Remap " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
+        tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+        deviceSize += Size;
+      }
     }
     HT.IsValid = true;
     HT.TgtPtrBegin = tp;
@@ -1023,6 +1038,7 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     HT.TimeStamp = GlobalTimeStamp;
     rc = (void *)tp;
   } else if ((lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA) && !IsImplicit) { // lld: invalid
+    // FIXME: reallocate space if necessary
     // Explicit extension of mapped data - not allowed.
     LLD_DP("Explicit extension of mapping is not allowed.\n");
   } else if (Size) {
@@ -1126,17 +1142,17 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
           DPxPTR(HT.TgtPtrBegin), Size);
       //RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
       // lld: for unified memory
-      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
-        deviceSize -= Size;
-        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
-        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-      }
+      //if (HT.TgtPtrBegin != HT.HstPtrBegin) {
+      //  deviceSize -= Size;
+      //  RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+      //  LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
+      //}
+      // lld: replacement
+      HT.IsValid = false;
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
           DPxPTR(HT.HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
       //HostDataToTargetMap.erase(lr.Entry);
-      // lld: replacement
-      HT.IsValid = false;
     }
     rc = OFFLOAD_SUCCESS;
   } else {
@@ -1619,6 +1635,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
   uint64_t ltc = Device.loopTripCnt;
   uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
   LLD_DP("%s\t(#iter: %lu    device: %lu    UM: %lu)\n", (data_region ? "DATA\t" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
+  GlobalTimeStamp++;
   dumpTargetData(&Device.HostDataToTargetMap);
   //for (int i=0; i<arg_num; ++i) {
   //  LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
