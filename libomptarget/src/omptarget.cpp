@@ -30,7 +30,8 @@
 
 // lld: GPU memory mode
 int GMode = 0;
-
+// lld: available device memory size
+uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
 // lld: global time stamp
 uint64_t GlobalTimeStamp = 0;
 
@@ -76,10 +77,12 @@ struct HostDataToTargetTy {
 
   // lld: whether data mapping is decided
   bool Decided = true;
-  int64_t MapType;
+  int64_t MapType = 0;
   // lld: replacement info
+  int64_t Reuse = 0;
   uint64_t TimeStamp = 0;
   bool IsValid = true;
+  bool IsDeleted = false;
 
   long RefCount;
 
@@ -139,6 +142,8 @@ struct DeviceTy {
   bool HasPendingGlobals;
 
   HostDataToTargetListTy HostDataToTargetMap;
+  // lld: replacement
+  HostDataToTargetListTy InvalidTargetDataList;
   PendingCtorsDtorsPerLibrary PendingCtorsDtors;
 
   ShadowPtrListTy ShadowPtrMap;
@@ -153,6 +158,7 @@ struct DeviceTy {
   DeviceTy(RTLInfoTy *RTL)
       : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), IsInit(false), InitFlag(),
         HasPendingGlobals(false), HostDataToTargetMap(),
+        InvalidTargetDataList(), // lld: replacement
         PendingCtorsDtors(), ShadowPtrMap(), DataMapMtx(), PendingGlobalsMtx(),
         ShadowMtx(), loopTripCnt(0) {}
 
@@ -162,6 +168,7 @@ struct DeviceTy {
       : DeviceID(d.DeviceID), RTL(d.RTL), RTLDeviceID(d.RTLDeviceID),
         IsInit(d.IsInit), InitFlag(), HasPendingGlobals(d.HasPendingGlobals),
         HostDataToTargetMap(d.HostDataToTargetMap),
+        InvalidTargetDataList(d.InvalidTargetDataList), // lld: replacement
         PendingCtorsDtors(d.PendingCtorsDtors), ShadowPtrMap(d.ShadowPtrMap),
         DataMapMtx(), PendingGlobalsMtx(),
         ShadowMtx(), loopTripCnt(d.loopTripCnt) {}
@@ -173,6 +180,7 @@ struct DeviceTy {
     IsInit = d.IsInit;
     HasPendingGlobals = d.HasPendingGlobals;
     HostDataToTargetMap = d.HostDataToTargetMap;
+    InvalidTargetDataList= d.InvalidTargetDataList; // lld: replacement
     PendingCtorsDtors = d.PendingCtorsDtors;
     ShadowPtrMap = d.ShadowPtrMap;
     loopTripCnt = d.loopTripCnt;
@@ -982,6 +990,8 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
         (CONSIDERED_INF(HT.RefCount)) ? "INF" :
             std::to_string(HT.RefCount).c_str());
     rc = (void *)tp;
+    // lld: update replacement info
+    HT.TimeStamp = GlobalTimeStamp;
   } else if ((lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) && !IsImplicit) {
     // Explicit extension of mapped data - not allowed.
     DP("Explicit extension of mapping is not allowed.\n");
@@ -1019,7 +1029,7 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
       tp = (uintptr_t)HstPtrBegin;
       RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 0);
     } else {
-      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
+      if (HT.TgtPtrBegin != HT.HstPtrBegin && !HT.IsDeleted) {
         LLD_DP("  Reassociate " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
         tp = HT.TgtPtrBegin;
       } else {
@@ -1073,6 +1083,7 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
       DataEntry.Decided = false;
     DataEntry.MapType = MapType;
     // lld: replacement info
+    DataEntry.Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
     DataEntry.TimeStamp = GlobalTimeStamp;
     HostDataToTargetMap.push_front(DataEntry);
     rc = (void *)tp;
@@ -1147,12 +1158,13 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
       //  RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
       //  LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
       //}
-      // lld: replacement
-      HT.IsValid = false;
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
           DPxPTR(HT.HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
       //HostDataToTargetMap.erase(lr.Entry);
+      // lld: replacement
+      HT.IsValid = false;
+      InvalidTargetDataList.push_front(*lr.Entry);
     }
     rc = OFFLOAD_SUCCESS;
   } else {
@@ -1633,7 +1645,6 @@ bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
 std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types, bool data_region) {
   int64_t used_dev_size = Device.deviceSize + Device.umSize;
   uint64_t ltc = Device.loopTripCnt;
-  uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
   LLD_DP("%s\t(#iter: %lu    device: %lu    UM: %lu)\n", (data_region ? "DATA\t" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
   GlobalTimeStamp++;
   dumpTargetData(&Device.HostDataToTargetMap);
@@ -1671,7 +1682,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
       if (DataSize == 0)
         continue;
       if (lr.Entry == Device.HostDataToTargetMap.end() ||
-          (!lr.Entry->Decided && lr.Entry->IsValid)) {
+          !lr.Entry->Decided || !lr.Entry->IsValid) {
         if (lr.Entry != Device.HostDataToTargetMap.end()) {
           // restore recorded maptype
           new_arg_types[idx] &= ~0x3ff;
@@ -1679,26 +1690,11 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
           // restore size
           new_arg_sizes[idx] = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
         }
-        unsigned LocalReuse = (arg_types[idx] & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
         if (used_dev_size + DataSize < total_dev_size) {
-          if (data_region) {
-            LLD_DP("  Arg %d mapping is not decided\n", idx);
-            new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-            new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
-          } else {
-            double LocalReuseFloat = (double)LocalReuse / 8.0;
-            double Density = LocalReuseFloat * ltc / DataSize;
-            if (Density < 0.6) {
-              LLD_DP("  Arg %d is intended for UM (%f)\n", idx, Density);
-              new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-            } else
-              LLD_DP("  Arg %d is intended for device (%f)\n", idx, Density);
-          }
+          placeDataObj(Device, idx, new_arg_types[idx], DataSize, ltc, data_region);
           used_dev_size += DataSize;
-        } else {
-          LLD_DP("  Arg %d is mapped to host\n", idx);
-          new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
-        }
+        } else
+          replaceDataObj(Device, idx, new_arg_types[idx], DataSize, ltc, data_region);
         LLD_DP("  Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
             ", Type=0x%" PRIx64 "\n", idx, DPxPTR(args_base[idx]), DPxPTR(args[idx]),
             new_arg_sizes[idx], new_arg_types[idx]);
