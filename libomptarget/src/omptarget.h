@@ -35,6 +35,9 @@
 #ifndef DPxPTR
 #define DPxPTR(ptr) ((int)(2*sizeof(uintptr_t))), ((uintptr_t) (ptr))
 #endif
+#else
+#define LLD_DP(...)                                                    \
+  {}
 #endif
 
 #define OFFLOAD_SUCCESS (0)

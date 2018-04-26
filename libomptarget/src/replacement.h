@@ -1,5 +1,27 @@
 // lld: utilities for replacement
 
+/// Data attributes for each data reference used in an OpenMP target region.
+enum mem_map_type {
+  MEM_MAPTYPE_DEV = 0,
+  MEM_MAPTYPE_UVM,
+  MEM_MAPTYPE_HOST,
+  MEM_MAPTYPE_UNDECIDE
+};
+
+// get map type
+inline mem_map_type getMemMapType(int64_t MapType) {
+  bool IsUVM = MapType & OMP_TGT_MAPTYPE_UVM;
+  bool IsHost = MapType & OMP_TGT_MAPTYPE_HOST;
+  if (IsUVM & IsHost)
+    return MEM_MAPTYPE_UNDECIDE;
+  else if (IsUVM)
+    return MEM_MAPTYPE_UVM;
+  else if (IsHost)
+    return MEM_MAPTYPE_HOST;
+  else
+    return MEM_MAPTYPE_DEV;
+}
+
 // dump all target data
 void dumpTargetData(HostDataToTargetListTy *DataList) {
   LLD_DP("Target data:\n");
@@ -38,7 +60,7 @@ void replaceDataObj(DeviceTy &Device, int32_t idx, int64_t &MapType, int64_t Siz
   std::vector<HostDataToTargetTy*> DeleteList;
   for (auto &HT : Device.HostDataToTargetMap) {
     // find objects with poorer locality
-    if (HT.Reuse > Reuse) {
+    if (HT.Reuse > Reuse && (HT.MapType & OMP_TGT_MAPTYPE_HOST) != OMP_TGT_MAPTYPE_HOST) {
       int64_t HTSize = HT.HstPtrEnd - HT.HstPtrBegin;
       if (!HT.IsDeleted && HTSize > 256) { // Do not replace small objects
         AvailSize += HTSize;
@@ -51,8 +73,10 @@ void replaceDataObj(DeviceTy &Device, int32_t idx, int64_t &MapType, int64_t Siz
 
   if (AvailSize < Size) {
     LLD_DP("  No enough space for replacement (%lu)\n", AvailSize);
-    LLD_DP("  Arg %d is mapped to host\n", idx);
-    MapType |= OMP_TGT_MAPTYPE_HOST;
+    if (getMemMapType(MapType) != MEM_MAPTYPE_HOST) {
+      LLD_DP("  Arg %d is mapped to host\n", idx);
+      MapType |= OMP_TGT_MAPTYPE_HOST;
+    }
     return;
   }
 
