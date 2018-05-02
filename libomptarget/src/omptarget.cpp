@@ -1657,11 +1657,6 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
   LLD_DP("%s\t(#iter: %lu    device: %lu    UM: %lu)\n", (data_region ? "DATA\t" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
   GlobalTimeStamp++;
   dumpTargetData(&Device.HostDataToTargetMap);
-  //for (int i=0; i<arg_num; ++i) {
-  //  LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-  //      ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
-  //      arg_sizes[i], arg_types[i]);
-  //}
   std::vector<std::pair<int32_t, int64_t>> argList;
   int64_t *new_arg_types = (int64_t*)malloc(sizeof(int64_t)*arg_num);
   int64_t *new_arg_sizes = (int64_t*)malloc(sizeof(int64_t)*arg_num);

@@ -19,7 +19,7 @@
 #include <stddef.h>
 
 // lld: debug print
-#define LLD_DEBUG
+//#define LLD_DEBUG
 #ifdef LLD_DEBUG
 #include <stdio.h>
 #define LLD_DP(...)                                                    \

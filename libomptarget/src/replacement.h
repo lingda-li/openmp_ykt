@@ -99,7 +99,10 @@ void replaceDataObj(DeviceTy &Device, int32_t idx, int64_t &MapType, int64_t Siz
       E->IsDeleted = true;
     } else {
       LLD_DP("  Replace " DPxMOD " from UM, size=%ld\n", DPxPTR(E->HstPtrBegin), ESize);
+      // Retrieve to host
       Device.RTL->data_opt(Device.RTLDeviceID, ESize, (void *)E->HstPtrBegin, 5);
+      // Pin to host
+      Device.RTL->data_opt(Device.RTLDeviceID, ESize, (void *)E->HstPtrBegin, 0);
       Device.umSize -= ESize;
       E->IsValid = false;
     }
