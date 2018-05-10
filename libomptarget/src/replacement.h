@@ -45,11 +45,12 @@ void placeDataObj(DeviceTy &Device, int32_t idx, int64_t &MapType, int64_t Size,
     unsigned LocalReuse = (MapType & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
     double LocalReuseFloat = (double)LocalReuse / 8.0;
     double Density = LocalReuseFloat * LTC / Size;
-    if (Density < 0.6) {
+    if (Density < 0.5) {
       LLD_DP("  Arg %d is intended for UM (%f)\n", idx, Density);
       MapType |= OMP_TGT_MAPTYPE_UVM;
     } else
       LLD_DP("  Arg %d is intended for device (%f)\n", idx, Density);
+      MapType |= OMP_TGT_MAPTYPE_SDEV;
   }
 }
 
@@ -109,4 +110,70 @@ void replaceDataObj(DeviceTy &Device, int32_t idx, int64_t &MapType, int64_t Siz
   }
   // place data
   placeDataObj(Device, idx, MapType, Size, LTC, data_region);
+}
+
+// lld: compare rank
+bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
+  return (A.second < B.second);
+}
+
+// lld: decide mapping based on rank
+std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types, bool data_region) {
+  int64_t used_dev_size = 0;
+  uint64_t ltc = Device.loopTripCnt;
+  LLD_DP("%s\t(#iter: %lu    device: %lu    UM: %lu)\n", (data_region ? "DATA\t" : "COMPUTE"), ltc, Device.deviceSize, Device.umSize);
+  GlobalTimeStamp++;
+  //dumpTargetData(&Device.HostDataToTargetMap);
+  std::vector<std::pair<int32_t, int64_t>> argList;
+  int64_t *new_arg_types = (int64_t*)malloc(sizeof(int64_t)*arg_num);
+  int64_t *new_arg_sizes = (int64_t*)malloc(sizeof(int64_t)*arg_num);
+  for (int32_t i = 0; i < arg_num; ++i) {
+    new_arg_types[i] = arg_types[i];
+    new_arg_sizes[i] = arg_sizes[i];
+    //if (arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT)
+    //  continue;
+    if (!(arg_types[i] & OMP_TGT_MAPTYPE_RANK))
+      continue;
+    unsigned Rank = (arg_types[i] & OMP_TGT_MAPTYPE_RANK) >> 12;
+    argList.push_back(std::make_pair(i, Rank));
+  }
+  std::sort(argList.begin(), argList.end(), compareRank);
+  for (auto I : argList) {
+    int32_t idx = I.first;
+    if (GMode == 1) // UM mode
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+    else if (GMode == 2) { // DEV mode
+    } else if (GMode == 3) // HOST mode
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+    else if (GMode == 4) // HYB mode
+      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HYB;
+    else { // Normal processing
+      uint64_t DataSize = arg_sizes[idx];
+      LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
+      if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter)
+        DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
+      if (DataSize == 0)
+        continue;
+      if (lr.Entry != Device.HostDataToTargetMap.end() &&
+          (!lr.Entry->Decided || !lr.Entry->IsValid)) {
+        // restore recorded maptype
+        new_arg_types[idx] &= ~0x3ff;
+        new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
+        // restore size
+        new_arg_sizes[idx] = DataSize;
+      }
+      if (lr.Entry != Device.HostDataToTargetMap.end() &&
+          ((lr.Entry->MapType & OMP_TGT_MAPTYPE_HOST) != OMP_TGT_MAPTYPE_HOST)) {
+        continue;
+      } else if (used_dev_size + Device.deviceSize + Device.umSize + DataSize < total_dev_size) {
+        placeDataObj(Device, idx, new_arg_types[idx], DataSize, ltc, data_region);
+        used_dev_size += DataSize;
+      } else
+        replaceDataObj(Device, idx, new_arg_types[idx], DataSize, ltc, data_region);
+      LLD_DP("  Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
+          ", Type=0x%" PRIx64 "\n", idx, DPxPTR(args_base[idx]), DPxPTR(args[idx]),
+          new_arg_sizes[idx], new_arg_types[idx]);
+    }
+  }
+  return std::make_pair(new_arg_types, new_arg_sizes);
 }

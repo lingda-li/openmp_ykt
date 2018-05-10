@@ -78,6 +78,10 @@ enum tgt_map_type {
   OMP_TGT_MAPTYPE_RANK            = 0xff000,
   // lld: local reuse
   OMP_TGT_MAPTYPE_LOCAL_REUSE     = 0xfff00000,
+  // lld: hybrid map
+  OMP_TGT_MAPTYPE_HYB             = 0x100000000,
+  // lld: soft device map
+  OMP_TGT_MAPTYPE_SDEV            = 0x200000000,
   // member of struct, member given by 4 MSBs - 1
   OMP_TGT_MAPTYPE_MEMBER_OF       = 0xffff000000000000
 };
