@@ -130,39 +130,6 @@ void releaseDataObj(DeviceTy &Device, HostDataToTargetTy *E) {
     Device.deviceSize -= Size;
     setMemMapType(E->MapType, MEM_MAPTYPE_HOST);
   }
-  return;
-  /*
-  */
-
-  bool IsUM = (E->HstPtrBegin == E->TgtPtrBegin);
-  // Retrieve data to host
-  if (!IsUM) {
-    LLD_DP("  Replace " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(E->HstPtrBegin), DPxPTR(E->TgtPtrBegin), Size);
-    if (E->IsValid) {
-      int rt = Device.data_retrieve((void*)E->HstPtrBegin, (void*)E->TgtPtrBegin, Size);
-      if (rt != OFFLOAD_SUCCESS) {
-        LLD_DP("  Error: Copying data from device failed.\n");
-      }
-      E->IsValid = false;
-    }
-    Device.deviceSize -= Size;
-    Device.RTL->data_delete(Device.RTLDeviceID, (void *)E->TgtPtrBegin);
-    E->IsDeleted = true;
-    //FIXME: also pin to host instead?
-  } else {
-    LLD_DP("  Replace " DPxMOD " from UM, size=%ld\n", DPxPTR(E->HstPtrBegin), Size);
-    // Pin to host
-    Device.RTL->data_opt(Device.RTLDeviceID, Size, (void *)E->HstPtrBegin, 0);
-    // Retrieve to host
-    Device.RTL->data_opt(Device.RTLDeviceID, Size, (void *)E->HstPtrBegin, 5);
-    //Device.umSize -= Size;
-    E->IsValid = false;
-    E->IsDeleted = true;
-    if (PreMap == MEM_MAPTYPE_UVM)
-      Device.umSize -= Size;
-    else
-      Device.deviceSize -= Size;
-  }
 }
 
 // replace a data object
