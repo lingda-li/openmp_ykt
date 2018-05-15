@@ -37,6 +37,10 @@ uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
 // lld: global time stamp
 uint64_t GlobalTimeStamp = 0;
 
+// lld: declare types in replacement.h
+struct DataClusterTy;
+typedef std::list<DataClusterTy> DataClusterListTy;
+
 #ifdef OMPTARGET_DEBUG
 static int DebugLevel = 1;
 
@@ -85,6 +89,10 @@ struct HostDataToTargetTy {
   uint64_t TimeStamp = 0;
   bool IsValid = true;
   bool IsDeleted = false;
+  bool Irreplaceable = false;
+  bool ChangeMap = false;
+  // lld: cluster info
+  std::list<DataClusterTy*> Clusters;
 
   long RefCount;
 
@@ -147,6 +155,10 @@ struct DeviceTy {
   // lld: replacement
   HostDataToTargetListTy InvalidTargetDataList;
   PendingCtorsDtorsPerLibrary PendingCtorsDtors;
+  // lld: clusters
+  DataClusterListTy DataClusters;
+  DataClusterTy *CurrentCluster;
+  bool IsNewCluster;
 
   ShadowPtrListTy ShadowPtrMap;
 
@@ -205,6 +217,8 @@ struct DeviceTy {
   int deallocTgtPtr(void *TgtPtrBegin, int64_t Size, bool ForceDelete);
   int associatePtr(void *HstPtrBegin, void *TgtPtrBegin, int64_t Size);
   int disassociatePtr(void *HstPtrBegin);
+  // lld: cluster
+  DataClusterTy *lookupCluster(void *Base);
 
   // calls to RTL
   int32_t initOnce();
@@ -947,208 +961,6 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
   return lr;
 }
 
-// Used by target_data_begin
-// Return the target pointer begin (where the data will be moved).
-// Allocate memory if this is the first occurrence if this mapping.
-// Increment the reference counter.
-// If NULL is returned, then either data allocation failed or the user tried
-// to do an illegal mapping.
-void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
-    //int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount) {
-    // lld: uvm
-    int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount,
-    int64_t MapType) {
-  // lld: get mapping types
-  bool UVM = MapType & OMP_TGT_MAPTYPE_UVM;
-  bool PinHost = MapType & OMP_TGT_MAPTYPE_HOST;
-  bool HYB = MapType & OMP_TGT_MAPTYPE_HYB;
-  bool SoftDev = MapType & OMP_TGT_MAPTYPE_SDEV;
-
-  void *rc = NULL;
-  DataMapMtx.lock();
-  LookupResult lr = lookupMapping(HstPtrBegin, Size);
-
-  // Check if the pointer is contained.
-  if (lr.Flags.IsContained ||
-      ((lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) && IsImplicit)) {
-    auto &HT = *lr.Entry;
-    IsNew = false;
-
-    if (UpdateRefCount)
-      ++HT.RefCount;
-
-    // lld: delay decision
-    if (!HT.Decided) {
-      if (UVM && PinHost) { // delay decision
-      } else if (UVM) {
-        LLD_DP("  Map " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
-        HT.TgtPtrBegin = (uintptr_t)HstPtrBegin;
-        umSize += Size;
-        HT.Decided = true;
-        HT.MapType = MapType;
-        //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
-        IsNew = true;
-      } else if (SoftDev) {
-        LLD_DP("  Map " DPxMOD " to soft device, size=%ld\n", DPxPTR(HstPtrBegin), Size);
-        HT.TgtPtrBegin = (uintptr_t)HstPtrBegin;
-        RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 4); // pin to device
-        RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 1); // prefetch
-        deviceSize += Size;
-        HT.Decided = true;
-        HT.MapType = MapType;
-        IsNew = true;
-      } else {
-        assert(!PinHost);
-        HT.TgtPtrBegin = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-        deviceSize += Size;
-        HT.Decided = true;
-        HT.MapType = MapType;
-        IsNew = true;
-        LLD_DP("  Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-      }
-    }
-    uintptr_t tp = HT.TgtPtrBegin + ((uintptr_t)HstPtrBegin - HT.HstPtrBegin);
-    DP("Mapping exists%s with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD ", "
-        "Size=%ld,%s RefCount=%s\n", (IsImplicit ? " (implicit)" : ""),
-        DPxPTR(HstPtrBegin), DPxPTR(tp), Size,
-        (UpdateRefCount ? " updated" : ""),
-        (CONSIDERED_INF(HT.RefCount)) ? "INF" :
-            std::to_string(HT.RefCount).c_str());
-    rc = (void *)tp;
-    // lld: update replacement info
-    HT.TimeStamp = GlobalTimeStamp;
-  } else if ((lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) && !IsImplicit) {
-    // Explicit extension of mapped data - not allowed.
-    DP("Explicit extension of mapping is not allowed.\n");
-  } else if (lr.Flags.InvalidContained ||
-      ((lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA) && IsImplicit)) { // lld: invalid
-    auto &HT = *lr.Entry;
-    IsNew = true;
-    assert(HT.Decided);
-
-    if (UpdateRefCount)
-      ++HT.RefCount;
-
-    HstPtrBegin = (void*)HT.HstPtrBegin;
-    Size = HT.HstPtrEnd - HT.HstPtrBegin;
-    uintptr_t tp;
-    if (UVM && PinHost) { // delay decision
-      tp = (uintptr_t)HstPtrBegin;
-      IsNew = false;
-    } else if (UVM) {
-      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
-        deviceSize -= Size;
-        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
-        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-      }
-      LLD_DP("  Remap " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
-      tp = (uintptr_t)HstPtrBegin;
-      umSize += Size;
-      //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
-    } else if (SoftDev) {
-      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
-        deviceSize -= Size;
-        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
-        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-      }
-      LLD_DP("  Remap " DPxMOD " to soft device, size=%ld\n", DPxPTR(HstPtrBegin), Size);
-      tp = (uintptr_t)HstPtrBegin;
-      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 4); // pin to device
-      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 1); // prefetch
-      deviceSize += Size;
-    } else if (PinHost) {
-      if (HT.TgtPtrBegin != HT.HstPtrBegin) {
-        deviceSize -= Size;
-        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
-        LLD_DP("  Unmap " DPxMOD " from device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-      }
-      tp = (uintptr_t)HstPtrBegin;
-      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 0);
-    } else {
-      if (HT.TgtPtrBegin != HT.HstPtrBegin && !HT.IsDeleted) {
-        LLD_DP("  Reassociate " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
-        tp = HT.TgtPtrBegin;
-      } else {
-        LLD_DP("  Remap " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
-        tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-        deviceSize += Size;
-      }
-    }
-    HT.IsValid = true;
-    HT.TgtPtrBegin = tp;
-    // lld: delay decision
-    if (UVM && PinHost)
-      HT.Decided = false;
-    HT.MapType = MapType;
-    // lld: replacement info
-    HT.TimeStamp = GlobalTimeStamp;
-    rc = (void *)tp;
-  } else if ((lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA) && !IsImplicit) { // lld: invalid
-    // FIXME: reallocate space if necessary
-    // Explicit extension of mapped data - not allowed.
-    LLD_DP("Explicit extension of mapping is not allowed.\n");
-  } else if (Size) {
-    // If it is not contained and Size > 0 we should create a new entry for it.
-    IsNew = true;
-    //uintptr_t tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-    // lld: uvm
-    uintptr_t tp;
-    if (UVM && PinHost) { // delay decision
-      tp = (uintptr_t)HstPtrBegin;
-      IsNew = false;
-    } else if (UVM) {
-      LLD_DP("  Map " DPxMOD " to UM, size=%ld\n", DPxPTR(HstPtrBegin), Size);
-      tp = (uintptr_t)HstPtrBegin;
-      umSize += Size;
-      //RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 2);
-    } else if (SoftDev) {
-      LLD_DP("  Map " DPxMOD " to soft device, size=%ld\n", DPxPTR(HstPtrBegin), Size);
-      tp = (uintptr_t)HstPtrBegin;
-      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 4); // pin to device
-      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 1); // prefetch
-      deviceSize += Size;
-    } else if (PinHost) {
-      tp = (uintptr_t)HstPtrBegin;
-      RTL->data_opt(RTLDeviceID, Size, HstPtrBegin, 0);
-    } else if (HYB) {
-      int64_t DevSize = Size * devMemRatio;
-      if (DevSize < Size) {
-        LLD_DP("  Map " DPxMOD " to both locations, size=%ld (%ld)\n", DPxPTR(HstPtrBegin), Size, DevSize);
-        tp = (uintptr_t)HstPtrBegin;
-        RTL->data_opt(RTLDeviceID, DevSize, HstPtrBegin, 4); // pin to device
-        RTL->data_opt(RTLDeviceID, DevSize, HstPtrBegin, 1); // prefetch
-        umSize += DevSize;
-        RTL->data_opt(RTLDeviceID, Size-DevSize, HstPtrBegin+DevSize, 0); // pin to host
-      } else {
-        tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-        deviceSize += Size;
-        LLD_DP("  Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
-      }
-    } else {
-      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-      deviceSize += Size;
-      LLD_DP("  Map " DPxMOD " to device (" DPxMOD "), size=%ld\n", DPxPTR(HstPtrBegin), DPxPTR(tp), Size);
-    }
-    DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
-        "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
-        DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
-    HostDataToTargetTy DataEntry = HostDataToTargetTy((uintptr_t)HstPtrBase,
-        (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp);
-    // lld: delay decision
-    if (UVM && PinHost)
-      DataEntry.Decided = false;
-    DataEntry.MapType = MapType;
-    // lld: replacement info
-    DataEntry.Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
-    DataEntry.TimeStamp = GlobalTimeStamp;
-    HostDataToTargetMap.push_front(DataEntry);
-    rc = (void *)tp;
-  }
-
-  DataMapMtx.unlock();
-  return rc;
-}
-
 // Used by target_data_begin, target_data_end, target_data_update and target.
 // Return the target pointer begin (where the data will be moved).
 // Decrement the reference counter if called from target_data_end.
@@ -1699,11 +1511,11 @@ static int member_of(int64_t type) {
 static int target_data_begin(DeviceTy &Device, int32_t arg_num,
     //void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
     // lld: target data region or not
-    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types, bool data_region) {
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types, void *host_ptr) {
   // process each input.
   int rc = OFFLOAD_SUCCESS;
   // lld: decide data mapping
-  auto TypeSize = target_uvm_data_mapping_opt(Device, args_base, args, arg_num, arg_sizes, arg_types, data_region);
+  auto TypeSize = target_uvm_data_mapping_opt(Device, args_base, args, arg_num, arg_sizes, arg_types, host_ptr);
   arg_types = TypeSize.first;
   arg_sizes = TypeSize.second;
   for (int32_t i = 0; i < arg_num; ++i) {
@@ -1879,7 +1691,7 @@ EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
 
   //target_data_begin(Device, arg_num, args_base, args, arg_sizes, arg_types);
   // lld: target data region or not
-  target_data_begin(Device, arg_num, args_base, args, arg_sizes, arg_types, true);
+  target_data_begin(Device, arg_num, args_base, args, arg_sizes, arg_types, NULL);
 }
 
 /// Internal function to undo the mapping and retrieve the data from the device.
@@ -2221,7 +2033,7 @@ static int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   int rc = target_data_begin(Device, arg_num, args_base, args, arg_sizes,
       //arg_types);
       // lld: target data region or not
-      arg_types, false);
+      arg_types, host_ptr);
 
   if (rc != OFFLOAD_SUCCESS) {
     DP("Call to target_data_begin failed, skipping target execution.\n");

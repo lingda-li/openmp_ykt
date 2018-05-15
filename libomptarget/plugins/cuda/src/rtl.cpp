@@ -545,10 +545,12 @@ void __tgt_rtl_data_opt(int32_t device_id, int64_t size, void *hst_ptr, int32_t 
     err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_ACCESSED_BY, device_id);
   else if (type == 3) // duplicate
     err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_READ_MOSTLY, device_id);
-  else if (type == 4) // half pin to device
+  else if (type == 4) // soft pin to device
     err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device_id);
   else if (type == 5) // prefetch to host
     err = cuMemPrefetchAsync((CUdeviceptr)hst_ptr, size, CU_DEVICE_CPU, 0);
+  else if (type == 6) // unpin
+    err = cuMemAdvise((CUdeviceptr)hst_ptr, size, CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION, device_id);
   else
     LLD_DP("    Invalid optimization\n");
   if (err != CUDA_SUCCESS) {
