@@ -45,13 +45,13 @@ inline mem_map_type getMemMapType(int64_t MapType) {
 
 inline void setMemMapType(int64_t &MapType, mem_map_type Type) {
   MapType &= ~(OMP_TGT_MAPTYPE_UVM | OMP_TGT_MAPTYPE_HOST | OMP_TGT_MAPTYPE_SDEV);
-  if (MEM_MAPTYPE_UNDECIDE)
+  if (Type == MEM_MAPTYPE_UNDECIDE)
     MapType |= (OMP_TGT_MAPTYPE_UVM | OMP_TGT_MAPTYPE_HOST);
-  else if (MEM_MAPTYPE_UVM)
+  else if (Type == MEM_MAPTYPE_UVM)
     MapType |= OMP_TGT_MAPTYPE_UVM;
-  else if (MEM_MAPTYPE_HOST)
+  else if (Type == MEM_MAPTYPE_HOST)
     MapType |= OMP_TGT_MAPTYPE_HOST;
-  else if (MEM_MAPTYPE_SDEV)
+  else if (Type == MEM_MAPTYPE_SDEV)
     MapType |= OMP_TGT_MAPTYPE_SDEV;
 }
 
@@ -138,8 +138,8 @@ bool replaceDataObj(DeviceTy &Device, HostDataToTargetTy *HT, int32_t idx, int64
   std::vector<HostDataToTargetTy*> DeleteList;
   for (auto &HT : Device.HostDataToTargetMap) {
     // if it belongs to the current cluster
-    if (HT.Irreplaceable)
-      continue;
+    //if (HT.Irreplaceable)
+    //  continue;
     // if it belongs to a pinned cluster
     if (isInDevCluster(&HT)) {
       continue;
@@ -208,11 +208,13 @@ void replaceDataCluster(DeviceTy &Device, int64_t Size, int64_t AvailSize, std::
     for (auto I : argList) {
       int32_t idx = I.first;
       LookupResult lr = LRs[idx];
-      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable)
+      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable) {
+        lr.Entry->Irreplaceable = false;
         continue;
-      placeDataObj(Device, &(*lr.Entry), idx, argTypes[idx], argSizes[idx], argBases[idx], LTC, false);
+      }
+      HostDataToTargetTy *HT = (lr.Entry != Device.HostDataToTargetMap.end() ? &(*lr.Entry) : NULL);
+      placeDataObj(Device, HT, idx, argTypes[idx], argSizes[idx], argBases[idx], LTC, false);
     }
-    cleanReplaceMetadata(Device);
     return;
   }
 
@@ -241,12 +243,15 @@ void replaceDataCluster(DeviceTy &Device, int64_t Size, int64_t AvailSize, std::
     for (auto I : argList) {
       int32_t idx = I.first;
       LookupResult lr = LRs[idx];
-      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable)
+      HostDataToTargetTy *HT = (lr.Entry != Device.HostDataToTargetMap.end() ? &(*lr.Entry) : NULL);
+      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable) {
+        lr.Entry->Irreplaceable = false;
         continue;
+      }
       if (argSizes[idx] <= (int64_t)(total_dev_size - used_dev_size - Device.deviceSize - Device.umSize)) {
-        placeDataObj(Device, &(*lr.Entry), idx, argTypes[idx], argSizes[idx], argBases[idx], LTC, false);
+        placeDataObj(Device, HT, idx, argTypes[idx], argSizes[idx], argBases[idx], LTC, false);
         used_dev_size += argSizes[idx];
-      } else if (replaceDataObj(Device, &(*lr.Entry), idx, argTypes[idx], argSizes[idx], total_dev_size - used_dev_size - Device.deviceSize - Device.umSize, argBases[idx], LTC, false))
+      } else if (replaceDataObj(Device, HT, idx, argTypes[idx], argSizes[idx], total_dev_size - used_dev_size - Device.deviceSize - Device.umSize, argBases[idx], LTC, false))
         used_dev_size += argSizes[idx];
     }
   } else {
@@ -262,12 +267,14 @@ void replaceDataCluster(DeviceTy &Device, int64_t Size, int64_t AvailSize, std::
     for (auto I : argList) {
       int32_t idx = I.first;
       LookupResult lr = LRs[idx];
-      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable)
+      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable) {
+        lr.Entry->Irreplaceable = false;
         continue;
-      placeDataObj(Device, &(*lr.Entry), idx, argTypes[idx], argSizes[idx], argBases[idx], LTC, false);
+      }
+      HostDataToTargetTy *HT = (lr.Entry != Device.HostDataToTargetMap.end() ? &(*lr.Entry) : NULL);
+      placeDataObj(Device, HT, idx, argTypes[idx], argSizes[idx], argBases[idx], LTC, false);
     }
   }
-  cleanReplaceMetadata(Device);
 }
 
 // Used by target_data_begin
@@ -598,7 +605,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
   else
     LLD_DP("COMPUTE (" DPxMOD ")\t(#iter: %lu    device: %lu    UM: %lu)\n", DPxPTR(host_ptr), ltc, Device.deviceSize, Device.umSize)
   GlobalTimeStamp++;
-  //dumpTargetData(&Device.HostDataToTargetMap);
+  dumpTargetData(&Device.HostDataToTargetMap);
 
   double CP = 0.0;
   std::vector<std::pair<int32_t, int64_t>> argList;
@@ -627,99 +634,106 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
     return std::make_pair(new_arg_types, new_arg_sizes);
 
   std::sort(argList.begin(), argList.end(), compareRank);
-  // look up cluster
-  if (!data_region) {
-    Device.CurrentCluster = Device.lookupCluster(host_ptr);
-    if (Device.CurrentCluster) {
-      Device.IsNewCluster = false;
-    } else {
-      Device.CurrentCluster = new DataClusterTy(host_ptr);
-      Device.DataClusters.push_front(*Device.CurrentCluster);
-      Device.IsNewCluster = true;
-    }
-  } else
-    Device.CurrentCluster = NULL;
-  if (Device.CurrentCluster)
-    Device.CurrentCluster->Priority = CP / argList.size();
+  if (GMode == 0) {
+    // look up cluster
+    if (!data_region) {
+      Device.CurrentCluster = Device.lookupCluster(host_ptr);
+      if (Device.CurrentCluster) {
+        Device.IsNewCluster = false;
+      } else {
+        Device.CurrentCluster = new DataClusterTy(host_ptr);
+        Device.DataClusters.push_front(*Device.CurrentCluster);
+        Device.IsNewCluster = true;
+      }
+    } else
+      Device.CurrentCluster = NULL;
+    if (Device.CurrentCluster)
+      Device.CurrentCluster->Priority = CP / argList.size();
 
-  // fix data size and map type
-  uint64_t CSize = 0;
-  uint64_t RSize = 0;
-  LookupResult *LRs = (LookupResult*)malloc(sizeof(LookupResult)*arg_num);
-  for (auto I : argList) {
-    int32_t idx = I.first;
-    uint64_t DataSize = arg_sizes[idx];
-    LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
-    if ((lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) ||
-        (lr.Flags.InvalidContained || lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA))
-      DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
-    new_arg_sizes[idx] = DataSize;
-    if (lr.Entry != Device.HostDataToTargetMap.end() &&
-        (!lr.Entry->Decided || !lr.Entry->IsValid)) {
-      // restore recorded maptype
-      new_arg_types[idx] &= ~0x3ff;
-      new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
-    }
-    // find out the required space for this cluster
-    if (lr.Entry == Device.HostDataToTargetMap.end() || !lr.Entry->IsValid ||
-        ((lr.Entry->MapType & OMP_TGT_MAPTYPE_HOST) == OMP_TGT_MAPTYPE_HOST))
-      RSize += DataSize;
-    else
-      lr.Entry->Irreplaceable = true;
-    LRs[idx] = lr;
-    CSize += DataSize;
-  }
-
-  // cluster mapping
-  if (RSize > 0 && Device.CurrentCluster) {
-    if (Device.IsNewCluster)
-      Device.CurrentCluster->Size = CSize;
-    else
-      assert(Device.CurrentCluster->Size == CSize && "The size of cluster should be consistent.");
-    replaceDataCluster(Device, RSize, total_dev_size - Device.deviceSize - Device.umSize, argList, LRs, new_arg_types, new_arg_sizes, args_base, ltc);
-  } else if (RSize > 0) {
+    // fix data size and map type
+    uint64_t CSize = 0;
+    uint64_t RSize = 0;
+    LookupResult *LRs = (LookupResult*)malloc(sizeof(LookupResult)*arg_num);
     for (auto I : argList) {
       int32_t idx = I.first;
-      LookupResult lr = LRs[idx];
-      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable)
-        continue;
-      LLD_DP("  Arg %d (" DPxMOD ") mapping is not decided\n", idx, DPxPTR(args_base[idx]));
-      new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
-      new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
-    }
-  }
-  free(LRs);
-  return std::make_pair(new_arg_types, new_arg_sizes);
-
-  // arguments mapping
-  for (auto I : argList) {
-    int32_t idx = I.first;
-    uint64_t DataSize = arg_sizes[idx];
-    LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
-    if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter)
-      DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
-    if (DataSize == 0)
-      continue;
-    if (lr.Entry != Device.HostDataToTargetMap.end() &&
-        (!lr.Entry->Decided || !lr.Entry->IsValid)) {
-      // restore recorded maptype
-      new_arg_types[idx] &= ~0x3ff;
-      new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
-      // restore size
+      uint64_t DataSize = arg_sizes[idx];
+      LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
+      if ((lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) ||
+          (lr.Flags.InvalidContained || lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA))
+        DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
       new_arg_sizes[idx] = DataSize;
+      if (lr.Entry != Device.HostDataToTargetMap.end() &&
+          (!lr.Entry->Decided || !lr.Entry->IsValid)) {
+        // restore recorded maptype
+        new_arg_types[idx] &= ~0x3ff;
+        new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
+      }
+      // find out the required space for this cluster
+      if (lr.Entry == Device.HostDataToTargetMap.end() || !lr.Entry->IsValid ||
+          ((lr.Entry->MapType & OMP_TGT_MAPTYPE_HOST) == OMP_TGT_MAPTYPE_HOST))
+        RSize += DataSize;
+      else
+        lr.Entry->Irreplaceable = true;
+      LRs[idx] = lr;
+      CSize += DataSize;
     }
-    if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->IsValid &&
-        ((lr.Entry->MapType & OMP_TGT_MAPTYPE_HOST) != OMP_TGT_MAPTYPE_HOST)) {
-      continue;
-    } else if (used_dev_size + Device.deviceSize + Device.umSize + DataSize <= total_dev_size) {
-      placeDataObj(Device, &(*lr.Entry), idx, new_arg_types[idx], DataSize, args_base[idx], ltc, data_region);
-      used_dev_size += DataSize;
-    } else
-      if (replaceDataObj(Device, &(*lr.Entry), idx, new_arg_types[idx], DataSize, total_dev_size - used_dev_size - Device.deviceSize - Device.umSize, args_base[idx], ltc, data_region))
+
+    // cluster mapping
+    if (RSize > 0 && Device.CurrentCluster) {
+      if (Device.IsNewCluster)
+        Device.CurrentCluster->Size = CSize;
+      else
+        assert(Device.CurrentCluster->Size == CSize && "The size of cluster should be consistent.");
+      replaceDataCluster(Device, RSize, total_dev_size - Device.deviceSize - Device.umSize, argList, LRs, new_arg_types, new_arg_sizes, args_base, ltc);
+    } else if (RSize > 0) {
+      for (auto I : argList) {
+        int32_t idx = I.first;
+        LookupResult lr = LRs[idx];
+        if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->Irreplaceable) {
+          lr.Entry->Irreplaceable = false;
+          continue;
+        }
+        LLD_DP("  Arg %d (" DPxMOD ") mapping is not decided\n", idx, DPxPTR(args_base[idx]));
+        new_arg_types[idx] |= OMP_TGT_MAPTYPE_UVM;
+        new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
+      }
+    }
+    free(LRs);
+  } else {
+    // arguments mapping
+    for (auto I : argList) {
+      int32_t idx = I.first;
+      uint64_t DataSize = arg_sizes[idx];
+      LookupResult lr = Device.lookupMapping(args_base[idx], DataSize);
+      //if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter)
+      if ((lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) ||
+          (lr.Flags.InvalidContained || lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA))
+        DataSize = lr.Entry->HstPtrEnd - lr.Entry->HstPtrBegin;
+      assert(DataSize > 0);
+      //if (DataSize == 0)
+      //  continue;
+      if (lr.Entry != Device.HostDataToTargetMap.end() &&
+          (!lr.Entry->Decided || !lr.Entry->IsValid)) {
+        // restore recorded maptype
+        new_arg_types[idx] &= ~0x3ff;
+        new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
+      }
+        // restore size
+        new_arg_sizes[idx] = DataSize;
+      HostDataToTargetTy *HT = (lr.Entry != Device.HostDataToTargetMap.end() ? &(*lr.Entry) : NULL);
+      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->IsValid &&
+          ((lr.Entry->MapType & OMP_TGT_MAPTYPE_HOST) != OMP_TGT_MAPTYPE_HOST)) {
+        continue;
+      } else if (used_dev_size + Device.deviceSize + Device.umSize + DataSize <= total_dev_size) {
+        placeDataObj(Device, HT, idx, new_arg_types[idx], DataSize, args_base[idx], ltc, data_region);
         used_dev_size += DataSize;
-    LLD_DP("  Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-        ", Type=0x%" PRIx64 "\n", idx, DPxPTR(args_base[idx]), DPxPTR(args[idx]),
-        new_arg_sizes[idx], new_arg_types[idx]);
+      } else
+        if (replaceDataObj(Device, HT, idx, new_arg_types[idx], DataSize, total_dev_size - used_dev_size - Device.deviceSize - Device.umSize, args_base[idx], ltc, data_region))
+          used_dev_size += DataSize;
+      //LLD_DP("  Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
+      //    ", Type=0x%" PRIx64 "\n", idx, DPxPTR(args_base[idx]), DPxPTR(args[idx]),
+      //    new_arg_sizes[idx], new_arg_types[idx]);
+    }
   }
   return std::make_pair(new_arg_types, new_arg_sizes);
 }

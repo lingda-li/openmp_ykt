@@ -366,7 +366,10 @@ void RTLsTy::LoadRTLs() {
   // lld: parse environment variables
   envStr = getenv("LLD_GPU_MODE");
   if (envStr) {
-    if (!strcmp(envStr, "UM")) {
+    if (!strcmp(envStr, "OBJ")) {
+      GMode = -1;
+      LLD_DP("Set mode to OBJ\n");
+    } else if (!strcmp(envStr, "UM")) {
       GMode = 1;
       LLD_DP("Set mode to UM\n");
     } else if (!strcmp(envStr, "DEV")) {
