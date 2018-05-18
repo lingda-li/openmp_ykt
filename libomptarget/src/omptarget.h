@@ -19,7 +19,7 @@
 #include <stddef.h>
 
 // lld: debug print
-#define LLD_DEBUG
+//#define LLD_DEBUG
 #ifdef LLD_DEBUG
 #include <stdio.h>
 #define LLD_DP(...)                                                    \
@@ -82,6 +82,8 @@ enum tgt_map_type {
   OMP_TGT_MAPTYPE_HYB             = 0x100000000,
   // lld: soft device map
   OMP_TGT_MAPTYPE_SDEV            = 0x200000000,
+  // lld: partial map
+  OMP_TGT_MAPTYPE_PART            = 0x400000000,
   // member of struct, member given by 4 MSBs - 1
   OMP_TGT_MAPTYPE_MEMBER_OF       = 0xffff000000000000
 };

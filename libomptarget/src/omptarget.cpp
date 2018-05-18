@@ -32,8 +32,10 @@
 int GMode = 0;
 // lld: whether to recycle GPU memory
 int RecycleMem = 0;
+// lld: whether to enable partial mapping
+bool PartialMap = false;
 // lld: available device memory size
-uint64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
+int64_t total_dev_size = 14 * 1024 * 1024 * 1024L;
 // lld: global time stamp
 uint64_t GlobalTimeStamp = 0;
 
@@ -93,6 +95,8 @@ struct HostDataToTargetTy {
   bool ChangeMap = false;
   // lld: cluster info
   std::list<DataClusterTy*> Clusters;
+  // lld: partial map
+  int64_t DevSize = 0;
 
   long RefCount;
 
@@ -166,9 +170,9 @@ struct DeviceTy {
 
   uint64_t loopTripCnt;
   // lld: memory management
-  uint64_t deviceSize;
-  uint64_t umSize;
-  uint64_t allocSize;
+  int64_t deviceSize;
+  int64_t umSize;
+  int64_t allocSize;
   double devMemRatio;
 
   DeviceTy(RTLInfoTy *RTL)
@@ -387,6 +391,11 @@ void RTLsTy::LoadRTLs() {
   if (envStr) {
     RecycleMem = std::stoi(envStr);
     LLD_DP("Set RecycleMem to %d\n", RecycleMem);
+  }
+  envStr = getenv("LLD_PARTIAL_MAP");
+  if (envStr) {
+    PartialMap = (std::stoi(envStr) != 0 ? true : false);
+    LLD_DP("Set PartialMap to %d\n", PartialMap);
   }
 
   DP("Loading RTLs...\n");
