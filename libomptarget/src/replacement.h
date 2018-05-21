@@ -77,8 +77,8 @@ void dumpTargetData(HostDataToTargetListTy *DataList) {
   int i = 0;
   for (auto &HT : *DataList) {
     LLD_DP("Entry %2d: Base=" DPxMOD ", Valid=%d, Deleted=%d, Reuse=%ld, Time=%lu, Size=%" PRId64
-        ", Type=0x%" PRIx64 "\n", i, DPxPTR(HT.HstPtrBegin), HT.IsValid, HT.IsDeleted, HT.Reuse, HT.TimeStamp,
-        HT.HstPtrEnd - HT.HstPtrBegin, HT.MapType);
+        ", DevSize=%" PRId64 " Type=0x%" PRIx64 "\n", i, DPxPTR(HT.HstPtrBegin), HT.IsValid, HT.IsDeleted, HT.Reuse, HT.TimeStamp,
+        HT.HstPtrEnd - HT.HstPtrBegin, HT.DevSize, HT.MapType);
     i++;
   }
   LLD_DP("\n");
@@ -151,6 +151,73 @@ void releaseDataObj(DeviceTy &Device, HostDataToTargetTy *E) {
   }
 }
 
+int64_t replaceDataObjPart(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, int64_t &MapType, int64_t Size, int64_t AvailSize, void *Base, uint64_t LTC, bool data_region) {
+  int64_t Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
+  std::vector<HostDataToTargetTy*> DeleteList;
+  for (auto &HT : Device.HostDataToTargetMap) {
+    // if it belongs to the current cluster
+    //if (HT.Irreplaceable)
+    //  continue;
+    // if it belongs to a pinned cluster
+    if (isInDevCluster(&HT)) {
+      continue;
+    }
+    // find objects with poorer locality
+    mem_map_type PreMap = getMemMapType(HT.MapType);
+    if (HT.Reuse > Reuse && PreMap == MEM_MAPTYPE_PART) {
+      int64_t HTSize;
+      if (PreMap == MEM_MAPTYPE_PART)
+        HTSize = HT.DevSize;
+      else
+        HTSize = HT.HstPtrEnd - HT.HstPtrBegin;
+      if (!HT.IsDeleted && HTSize >= 4096) { // Do not replace small objects
+        AvailSize += HTSize;
+        DeleteList.push_back(&HT);
+        // FIXME: not those with worst locality
+        // FIXME: did not consider combined locality
+        if (AvailSize >= Size)
+          break;
+      }
+    }
+  }
+
+  assert(AvailSize < Size);
+  LLD_DP("  Not enough space for replacement (%ld < %ld)\n", AvailSize, Size);
+  if (AvailSize >= 4096) {
+    // release space
+    for (auto *E : DeleteList)
+      releaseDataObj(Device, E);
+    // partial map
+    mem_map_type PreMap = MEM_MAPTYPE_UNDECIDE;
+    if (Entry)
+      PreMap = getMemMapType(Entry->MapType);
+    PartDevSize = AvailSize;
+    if (PreMap == MEM_MAPTYPE_PART) {
+      int64_t NewDevSize = AvailSize - Entry->DevSize;
+      if (NewDevSize >= 4096) {
+        LLD_DP("  Arg %d (" DPxMOD ") is remapped to part\n", idx, DPxPTR(Base));
+        setMemMapType(MapType, MEM_MAPTYPE_PART);
+        Entry->ChangeMap = true;
+        return NewDevSize;
+      } else
+        return 0;
+    } else {
+      LLD_DP("  Arg %d (" DPxMOD ") is mapped to part\n", idx, DPxPTR(Base));
+      setMemMapType(MapType, MEM_MAPTYPE_PART);
+      return AvailSize;
+    }
+  } else {
+    mem_map_type PreMap = MEM_MAPTYPE_UNDECIDE;
+    if (Entry)
+      PreMap = getMemMapType(Entry->MapType);
+    if (PreMap == MEM_MAPTYPE_UNDECIDE) {
+      LLD_DP("  Arg %d (" DPxMOD ") is mapped to host\n", idx, DPxPTR(Base));
+      setMemMapType(MapType, MEM_MAPTYPE_HOST);
+    }
+  }
+  return 0;
+}
+
 // replace a data object
 int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, int64_t &MapType, int64_t Size, int64_t AvailSize, void *Base, uint64_t LTC, bool data_region) {
   int64_t Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
@@ -165,7 +232,8 @@ int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx,
     }
     // find objects with poorer locality
     mem_map_type PreMap = getMemMapType(HT.MapType);
-    if (HT.Reuse > Reuse && PreMap <= MEM_MAPTYPE_PART) {
+    if ((HT.Reuse > Reuse && PreMap <= MEM_MAPTYPE_PART) ||
+        (PreMap == MEM_MAPTYPE_PART && Entry != &HT)) {
       int64_t HTSize;
       if (PreMap == MEM_MAPTYPE_PART)
         HTSize = HT.DevSize;
@@ -184,37 +252,14 @@ int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx,
 
   if (AvailSize < Size) {
     LLD_DP("  Not enough space for replacement (%ld < %ld)\n", AvailSize, Size);
-    if (PartialMap && AvailSize >= 4096) {
-      // release space
-      for (auto *E : DeleteList)
-        releaseDataObj(Device, E);
-      // partial map
-      mem_map_type PreMap = MEM_MAPTYPE_UNDECIDE;
-      if (Entry)
-        PreMap = getMemMapType(Entry->MapType);
-      PartDevSize = AvailSize;
-      if (PreMap == MEM_MAPTYPE_PART) {
-        int64_t NewDevSize = AvailSize - Entry->DevSize;
-        if (NewDevSize >= 4096) {
-          setMemMapType(MapType, MEM_MAPTYPE_PART);
-          Entry->ChangeMap = true;
-          return NewDevSize;
-        } else
-          return 0;
-      } else {
-        setMemMapType(MapType, MEM_MAPTYPE_PART);
-        return AvailSize;
-      }
-    } else {
-      mem_map_type PreMap = MEM_MAPTYPE_UNDECIDE;
-      if (Entry)
-        PreMap = getMemMapType(Entry->MapType);
-      if (PreMap == MEM_MAPTYPE_UNDECIDE) {
-        LLD_DP("  Arg %d (" DPxMOD ") is mapped to host\n", idx, DPxPTR(Base));
-        setMemMapType(MapType, MEM_MAPTYPE_HOST);
-      }
-      return 0;
+    mem_map_type PreMap = MEM_MAPTYPE_UNDECIDE;
+    if (Entry)
+      PreMap = getMemMapType(Entry->MapType);
+    if (PreMap == MEM_MAPTYPE_UNDECIDE) {
+      LLD_DP("  Arg %d (" DPxMOD ") is intended for host\n", idx, DPxPTR(Base));
+      setMemMapType(MapType, MEM_MAPTYPE_HOST);
     }
+    return 0;
   }
 
   // release space
@@ -716,8 +761,8 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     // lld: replacement info
     DataEntry.Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
     DataEntry.TimeStamp = GlobalTimeStamp;
-    DMEP = &DataEntry;
     HostDataToTargetMap.push_front(DataEntry);
+    DMEP = &(*HostDataToTargetMap.begin());
     rc = (void *)tp;
   }
 
@@ -842,6 +887,9 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
     }
     free(LRs);
   } else {
+    // argument index for partial mapping
+    int32_t partial_idx = -1;
+    HostDataToTargetTy *partial_HT;
     // arguments mapping
     for (auto I : argList) {
       int32_t idx = I.first;
@@ -867,11 +915,23 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
       int64_t AvailSize = total_dev_size - used_dev_size - Device.deviceSize - Device.umSize;
       assert(AvailSize > -1024); // reserve space for non UM variables
       if (HT && getMemMapType(HT->MapType) == MEM_MAPTYPE_PART)
-        AvailSize += lr.Entry->DevSize;
+        AvailSize += HT->DevSize;
       if (DataSize <= AvailSize)
         used_dev_size += placeDataObj(Device, HT, idx, new_arg_types[idx], DataSize, args_base[idx], ltc, data_region);
-      else
-        used_dev_size += replaceDataObj(Device, HT, idx, new_arg_types[idx], DataSize, AvailSize, args_base[idx], ltc, data_region);
+      else {
+        int64_t allocateSize = replaceDataObj(Device, HT, idx, new_arg_types[idx], DataSize, AvailSize, args_base[idx], ltc, data_region);
+        used_dev_size += allocateSize;
+        if (PartialMap && allocateSize == 0 && partial_idx == -1) {
+          partial_idx = idx;
+          partial_HT = HT;
+        }
+      }
+    }
+    if (PartialMap && partial_idx >= 0) {
+      int64_t AvailSize = total_dev_size - used_dev_size - Device.deviceSize - Device.umSize;
+      if (partial_HT && getMemMapType(partial_HT->MapType) == MEM_MAPTYPE_PART)
+        AvailSize += partial_HT->DevSize;
+      replaceDataObjPart(Device, partial_HT, partial_idx, new_arg_types[partial_idx], new_arg_sizes[partial_idx], AvailSize, args_base[partial_idx], ltc, data_region);
     }
   }
   return std::make_pair(new_arg_types, new_arg_sizes);
