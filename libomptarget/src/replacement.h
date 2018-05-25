@@ -62,7 +62,7 @@ inline void setMemMapType(int64_t &MapType, mem_map_type Type) {
   else if (Type == MEM_MAPTYPE_PART)
     MapType |= OMP_TGT_MAPTYPE_PART;
   else
-    assert(0);
+    assert(Type == MEM_MAPTYPE_DEV);
 }
 
 bool isInDevCluster(HostDataToTargetTy *E) {
@@ -107,9 +107,10 @@ int64_t placeDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, i
     if (Density < 0.5) {
       LLD_DP("  Arg %d (" DPxMOD ") is intended for UM (%f)\n", idx, DPxPTR(Base), Density);
       MapType |= OMP_TGT_MAPTYPE_UVM;
-    } else
+    } else {
       LLD_DP("  Arg %d (" DPxMOD ") is intended for device (%f)\n", idx, DPxPTR(Base), Density);
       MapType |= OMP_TGT_MAPTYPE_SDEV;
+    }
   }
   if (Entry)
     Entry->ChangeMap = true;
@@ -313,6 +314,7 @@ void cleanReplaceMetadata(DeviceTy &Device) {
 }
 
 void replaceDataCluster(DeviceTy &Device, int64_t Size, int64_t AvailSize, std::vector<std::pair<int32_t, int64_t>> &argList, LookupResult *LRs, int64_t *argTypes, int64_t *argSizes, void **argBases, uint64_t LTC) {
+  //LLD_DP("  Cluster " DPxMOD ", size=%ld, avail=%ld\n", DPxPTR(Device.CurrentCluster->BasePtr), Size, AvailSize);
   int64_t OriAvailSize = AvailSize;
   if (AvailSize >= Size) {
     LLD_DP("  Cluster " DPxMOD " uses device mapping\n", DPxPTR(Device.CurrentCluster->BasePtr));
@@ -809,15 +811,15 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     DataEntry.TimeStamp = GlobalTimeStamp;
     HostDataToTargetMap.push_front(DataEntry);
     DMEP = &(*HostDataToTargetMap.begin());
+    // lld: insert to cluster
+    if (CurrentCluster && IsNewCluster) {
+      CurrentCluster->Members.push_front(DMEP);
+      DMEP->Clusters.push_front(CurrentCluster);
+    }
     rc = (void *)tp;
   }
 
   DataMapMtx.unlock();
-  // lld: insert to cluster
-  if (CurrentCluster && IsNewCluster) {
-    CurrentCluster->Members.push_front(DMEP);
-    DMEP->Clusters.push_front(CurrentCluster);
-  }
   if (CurMap == MEM_MAPTYPE_PART)
     DMEP->DevSize = PartDevSize;
   return rc;
@@ -900,6 +902,12 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
         // restore recorded maptype
         new_arg_types[idx] &= ~0x3ff;
         new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
+      }
+      // lld: insert to cluster
+      if (lr.Entry != Device.HostDataToTargetMap.end() &&
+          Device.CurrentCluster) {
+        lr.Entry->Clusters.push_front(Device.CurrentCluster);
+        Device.CurrentCluster->Members.push_front(&*(lr.Entry));
       }
       // find out the required space for this cluster
       if (lr.Entry == Device.HostDataToTargetMap.end() || !lr.Entry->IsValid ||
