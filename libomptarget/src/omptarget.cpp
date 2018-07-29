@@ -93,6 +93,7 @@ struct HostDataToTargetTy {
   bool IsDeleted = false;
   bool Irreplaceable = false;
   bool ChangeMap = false;
+  uint64_t ReuseDist = 0;
   // lld: cluster info
   std::list<DataClusterTy*> Clusters;
   // lld: partial map
@@ -385,6 +386,9 @@ void RTLsTy::LoadRTLs() {
     } else if (!strcmp(envStr, "HYB")) {
       GMode = 4;
       LLD_DP("Set mode to HYB\n");
+    } else if (!strcmp(envStr, "SDEV")) {
+      GMode = 5;
+      LLD_DP("Set mode to SDEV\n");
     }
   }
   envStr = getenv("LLD_RECYCLE");

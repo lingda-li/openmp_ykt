@@ -1,5 +1,8 @@
 // lld: utilities for replacement
 
+#define REUSE_DIST_CENTRIC
+#define NO_ON_DEMAND
+
 /// Data object cluster
 enum data_cluster_type {
   CLUSTER_MAPTYPE_DEV = 0,
@@ -10,7 +13,7 @@ enum data_cluster_type {
 struct DataClusterTy {
   void *BasePtr;
   std::list<HostDataToTargetTy*> Members;
-  data_cluster_type Type;
+  data_cluster_type Type = CLUSTER_MAPTYPE_MIX;
   uint64_t Size = 0;
   double Priority = 0.0;
 
@@ -65,6 +68,18 @@ inline void setMemMapType(int64_t &MapType, mem_map_type Type) {
     assert(Type == MEM_MAPTYPE_DEV);
 }
 
+inline unsigned getLocalReuse(int64_t MapType) {
+  return (MapType & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
+}
+
+inline int64_t getGlobalReuse(int64_t MapType) {
+  return (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
+}
+
+inline uint64_t getReuseDist(int64_t MapType) {
+  return (MapType & OMP_TGT_MAPTYPE_DIST) >> 40;
+}
+
 bool isInDevCluster(HostDataToTargetTy *E) {
   for (auto *C : E->Clusters) {
     if (C->Type == CLUSTER_MAPTYPE_DEV)
@@ -86,8 +101,8 @@ void dumpTargetData(HostDataToTargetListTy *DataList) {
   LLD_DP("Target data:\n");
   int i = 0;
   for (auto &HT : *DataList) {
-    LLD_DP("Entry %2d: Base=" DPxMOD ", Valid=%d, Deleted=%d, Reuse=%ld, Time=%lu, Size=%" PRId64
-        ", DevSize=%" PRId64 " Type=0x%" PRIx64 "\n", i, DPxPTR(HT.HstPtrBegin), HT.IsValid, HT.IsDeleted, HT.Reuse, HT.TimeStamp,
+    LLD_DP("Entry %2d: Base=" DPxMOD ", Valid=%d, Deleted=%d, Reuse=%ld, ReuseDist=%lu, Time=%lu, Size=%" PRId64
+        ", DevSize=%" PRId64 " Type=0x%" PRIx64 "\n", i, DPxPTR(HT.HstPtrBegin), HT.IsValid, HT.IsDeleted, HT.Reuse, HT.ReuseDist, HT.TimeStamp,
         HT.HstPtrEnd - HT.HstPtrBegin, HT.DevSize, HT.MapType);
     i++;
   }
@@ -101,12 +116,16 @@ int64_t placeDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, i
     MapType |= OMP_TGT_MAPTYPE_UVM;
     MapType |= OMP_TGT_MAPTYPE_HOST;
   } else {
-    unsigned LocalReuse = (MapType & OMP_TGT_MAPTYPE_LOCAL_REUSE) >> 20;
+    unsigned LocalReuse = getLocalReuse(MapType);
     double LocalReuseFloat = (double)LocalReuse / 8.0;
     double Density = LocalReuseFloat * LTC / Size;
     if (Density < 0.5) {
       LLD_DP("  Arg %d (" DPxMOD ") is intended for UM (%f)\n", idx, DPxPTR(Base), Density);
+#ifdef NO_ON_DEMAND
+      MapType |= OMP_TGT_MAPTYPE_SDEV;
+#else
       MapType |= OMP_TGT_MAPTYPE_UVM;
+#endif
     } else {
       LLD_DP("  Arg %d (" DPxMOD ") is intended for device (%f)\n", idx, DPxPTR(Base), Density);
       MapType |= OMP_TGT_MAPTYPE_SDEV;
@@ -165,19 +184,20 @@ int64_t releaseDataObj(DeviceTy &Device, HostDataToTargetTy *E) {
 }
 
 int64_t replaceDataObjPart(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, int64_t &MapType, int64_t Size, int64_t AvailSize, void *Base, uint64_t LTC, bool data_region) {
-  int64_t Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
+#ifdef REUSE_DIST_CENTRIC
+  uint64_t ReuseDist = getReuseDist(MapType);
+#else
+  int64_t Reuse = getGlobalReuse(MapType);
+#endif
   std::vector<HostDataToTargetTy*> ReplaceList;
   for (auto &HT : Device.HostDataToTargetMap) {
-    // if it belongs to the current cluster
-    //if (HT.Irreplaceable)
-    //  continue;
-    // if it belongs to a pinned cluster
-    if (isInDevCluster(&HT)) {
-      continue;
-    }
     // find objects with poorer locality
     mem_map_type PreMap = getMemMapType(HT.MapType);
+#ifdef REUSE_DIST_CENTRIC
+    if (HT.ReuseDist + HT.TimeStamp > GlobalTimeStamp + ReuseDist && PreMap == MEM_MAPTYPE_PART && Entry != &HT) {
+#else
     if (HT.Reuse > Reuse && PreMap == MEM_MAPTYPE_PART) {
+#endif
       int64_t HTSize = HT.DevSize;
       if (!HT.IsDeleted && HTSize >= 4096) { // Do not replace small objects
         AvailSize += HTSize;
@@ -188,7 +208,7 @@ int64_t replaceDataObjPart(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t 
   }
 
   assert(AvailSize < Size);
-  LLD_DP("  Not enough space for replacement (%ld < %ld)\n", AvailSize, Size);
+  LLD_DP("  Not enough space for replacement (%ld < %ld, %lu obj)\n", AvailSize, Size, ReplaceList.size());
   if (AvailSize >= 4096) {
     // release space
     for (auto *E : ReplaceList)
@@ -227,27 +247,40 @@ int64_t replaceDataObjPart(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t 
 }
 
 // lld: compare reuse
-bool compareReuse(HostDataToTargetTy *A, HostDataToTargetTy *B) {
+bool compareCandidates(HostDataToTargetTy *A, HostDataToTargetTy *B) {
+#ifdef REUSE_DIST_CENTRIC
+  uint64_t AR = A->ReuseDist + A->TimeStamp;
+  uint64_t BR = B->ReuseDist + B->TimeStamp;
+  return (AR == BR) ? (A->Reuse > B->Reuse) : (AR > BR);
+#else
   return (A->Reuse > B->Reuse);
+#endif
 }
 
 // replace a data object
 int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, int64_t &MapType, int64_t Size, int64_t AvailSize, void *Base, uint64_t LTC, bool data_region) {
   int64_t OriAvailSize = AvailSize;
-  int64_t Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
+#ifdef REUSE_DIST_CENTRIC
+  uint64_t ReuseDist = getReuseDist(MapType);
+#else
+  int64_t Reuse = getGlobalReuse(MapType);
+#endif
   std::vector<HostDataToTargetTy*> ReplaceList;
   for (auto &HT : Device.HostDataToTargetMap) {
-    // if it belongs to the current cluster
-    //if (HT.Irreplaceable)
-    //  continue;
-    // if it belongs to a pinned cluster
-    if (isInDevCluster(&HT)) {
+    // if it is not replaceable
+    if (HT.Irreplaceable)
       continue;
-    }
+    // if it belongs to a pinned cluster
+    if (isInDevCluster(&HT))
+      continue;
     // find objects with poorer locality
     mem_map_type PreMap = getMemMapType(HT.MapType);
-    if ((HT.Reuse > Reuse && PreMap <= MEM_MAPTYPE_PART) ||
-        (PreMap == MEM_MAPTYPE_PART && Entry != &HT)) {
+#ifdef REUSE_DIST_CENTRIC
+    if ((HT.ReuseDist + HT.TimeStamp > GlobalTimeStamp + ReuseDist && PreMap < MEM_MAPTYPE_PART) ||
+#else
+    if ((HT.Reuse > Reuse && PreMap < MEM_MAPTYPE_PART) ||
+#endif
+        (PreMap == MEM_MAPTYPE_PART && Entry != &HT)) { // implicitly assume at most 1 is mapped to part
       int64_t HTSize;
       if (PreMap == MEM_MAPTYPE_PART)
         HTSize = HT.DevSize;
@@ -263,10 +296,10 @@ int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx,
   }
 
   // sort replace list based on reuse
-  std::sort(ReplaceList.begin(), ReplaceList.end(), compareReuse);
+  std::sort(ReplaceList.begin(), ReplaceList.end(), compareCandidates);
 
   if (AvailSize < Size) {
-    LLD_DP("  Not enough space for replacement (%ld < %ld)\n", AvailSize, Size);
+    LLD_DP("  Not enough space for replacement (%ld < %ld, %lu obj)\n", AvailSize, Size, ReplaceList.size());
     mem_map_type PreMap = MEM_MAPTYPE_UNDECIDE;
     if (Entry)
       PreMap = getMemMapType(Entry->MapType);
@@ -400,7 +433,7 @@ void replaceDataCluster(DeviceTy &Device, int64_t Size, int64_t AvailSize, std::
     Device.CurrentCluster->Type = CLUSTER_MAPTYPE_DEV;
     AvailSize = OriAvailSize;
     // sort replace list based on reuse
-    std::sort(ReplaceList.begin(), ReplaceList.end(), compareReuse);
+    std::sort(ReplaceList.begin(), ReplaceList.end(), compareCandidates);
     for (auto *E : ReplaceList) {
       AvailSize += releaseDataObj(Device, E);
       if (AvailSize >= Size)
@@ -665,8 +698,6 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
         (CONSIDERED_INF(HT.RefCount)) ? "INF" :
             std::to_string(HT.RefCount).c_str());
     rc = (void *)tp;
-    // lld: update replacement info
-    HT.TimeStamp = GlobalTimeStamp;
   } else if ((lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) && !IsImplicit) {
     // Explicit extension of mapped data - not allowed.
     DP("Explicit extension of mapping is not allowed.\n");
@@ -741,8 +772,6 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     HT.TgtPtrBegin = tp;
     HT.MapType = MapType;
     HT.ChangeMap = false;
-    // lld: replacement info
-    HT.TimeStamp = GlobalTimeStamp;
     rc = (void *)tp;
   } else if ((lr.Flags.InvalidExtendsB || lr.Flags.InvalidExtendsA) && !IsImplicit) { // lld: invalid
     // FIXME: reallocate space if necessary
@@ -807,8 +836,7 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
       DataEntry.Decided = false;
     DataEntry.MapType = MapType;
     // lld: replacement info
-    DataEntry.Reuse = (MapType & OMP_TGT_MAPTYPE_RANK) >> 12;
-    DataEntry.TimeStamp = GlobalTimeStamp;
+    DataEntry.Reuse = getGlobalReuse(MapType);
     HostDataToTargetMap.push_front(DataEntry);
     DMEP = &(*HostDataToTargetMap.begin());
     // lld: insert to cluster
@@ -820,27 +848,54 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
   }
 
   DataMapMtx.unlock();
+#ifdef LLD_VERBOSE
+  if (DMEP->ReuseDist > 0 && CurrentCluster) {
+    if (DMEP->ReuseDist + DMEP->TimeStamp == GlobalTimeStamp) {
+      LLD_DP("  Reuse distance hit\n");
+    } else {
+      LLD_DP("  Reuse distance miss: %lu + %lu != %lu\n", DMEP->TimeStamp, DMEP->ReuseDist, GlobalTimeStamp);
+    }
+  }
+#endif
+  // lld: update replacement info
+  DMEP->TimeStamp = GlobalTimeStamp;
+  DMEP->ReuseDist = getReuseDist(MapType);
   if (CurMap == MEM_MAPTYPE_PART)
     DMEP->DevSize = PartDevSize;
   return rc;
 }
 
 // lld: compare rank
-bool compareRank(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
-  return (A.second < B.second);
+bool rankArgs(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B) {
+  int64_t AG = getGlobalReuse(A.second);
+  int64_t BG = getGlobalReuse(B.second);
+#ifdef REUSE_DIST_CENTRIC
+  int64_t ARD = getReuseDist(A.second);
+  int64_t BRD = getReuseDist(B.second);
+  return (ARD == BRD) ? (AG < BG) : (ARD < BRD);
+#else
+  return (AG < BG);
+#endif
 }
 
 // lld: decide mapping based on rank
 std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void **args_base, void **args, int32_t arg_num, int64_t *arg_sizes, int64_t *arg_types, void *host_ptr) {
+#ifdef LLD_VERBOSE
+  dumpTargetData(&Device.HostDataToTargetMap);
+#endif
+  for (int i=0; i<arg_num; ++i) {
+    LLD_DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
+        ", Type=0x%" PRIx64 "\n", i, DPxPTR(args_base[i]), DPxPTR(args[i]),
+        arg_sizes[i], arg_types[i]);
+  }
+  GlobalTimeStamp++;
   int64_t used_dev_size = 0;
   uint64_t ltc = Device.loopTripCnt;
   bool data_region = (host_ptr == NULL ? true : false);
   if (data_region)
-    LLD_DP("DATA\t\t\t\t(#iter: %lu    device: %ld    UM: %ld)\n", ltc, Device.deviceSize, Device.umSize)
+    LLD_DP("DATA\t\t\t\t(#iter: %lu    device: %ld    UM: %ld) at %lu\n", ltc, Device.deviceSize, Device.umSize, GlobalTimeStamp)
   else
-    LLD_DP("COMPUTE (" DPxMOD ")\t(#iter: %lu    device: %ld    UM: %ld)\n", DPxPTR(host_ptr), ltc, Device.deviceSize, Device.umSize)
-  GlobalTimeStamp++;
-  //dumpTargetData(&Device.HostDataToTargetMap);
+    LLD_DP("COMPUTE (" DPxMOD ")\t(#iter: %lu    device: %ld    UM: %ld) at %lu\n", DPxPTR(host_ptr), ltc, Device.deviceSize, Device.umSize, GlobalTimeStamp)
 
   double CP = 0.0;
   std::vector<std::pair<int32_t, int64_t>> argList;
@@ -853,8 +908,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
     //  continue;
     if (!(arg_types[i] & OMP_TGT_MAPTYPE_RANK))
       continue;
-    unsigned Rank = (arg_types[i] & OMP_TGT_MAPTYPE_RANK) >> 12;
-    argList.push_back(std::make_pair(i, Rank));
+    argList.push_back(std::make_pair(i, arg_types[i]));
     if (GMode == 1) // UM mode
       new_arg_types[i] |= OMP_TGT_MAPTYPE_UVM;
     else if (GMode == 2) { // DEV mode
@@ -862,29 +916,31 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
       new_arg_types[i] |= OMP_TGT_MAPTYPE_HOST;
     else if (GMode == 4) // HYB mode
       new_arg_types[i] |= OMP_TGT_MAPTYPE_HYB;
+    else if (GMode == 5) // SDEV mode
+      new_arg_types[i] |= OMP_TGT_MAPTYPE_SDEV;
     // cluster priority
-    CP += Rank;
+    CP += getGlobalReuse(arg_types[i]);
   }
   if (GMode > 0 || argList.size() == 0)
     return std::make_pair(new_arg_types, new_arg_sizes);
 
-  std::sort(argList.begin(), argList.end(), compareRank);
-  if (GMode == 0) {
-    // look up cluster
-    if (!data_region) {
-      Device.CurrentCluster = Device.lookupCluster(host_ptr);
-      if (Device.CurrentCluster) {
-        Device.IsNewCluster = false;
-      } else {
-        Device.DataClusters.push_front(DataClusterTy(host_ptr));
-        Device.CurrentCluster = &*(Device.DataClusters.begin());
-        Device.IsNewCluster = true;
-      }
-    } else
-      Device.CurrentCluster = NULL;
-    if (Device.CurrentCluster)
-      Device.CurrentCluster->Priority = CP / argList.size();
+  std::sort(argList.begin(), argList.end(), rankArgs);
+  // look up cluster
+  if (!data_region) {
+    Device.CurrentCluster = Device.lookupCluster(host_ptr);
+    if (Device.CurrentCluster) {
+      Device.IsNewCluster = false;
+    } else {
+      Device.DataClusters.push_front(DataClusterTy(host_ptr));
+      Device.CurrentCluster = &*(Device.DataClusters.begin());
+      Device.IsNewCluster = true;
+    }
+  } else
+    Device.CurrentCluster = NULL;
+  if (Device.CurrentCluster)
+    Device.CurrentCluster->Priority = CP / argList.size();
 
+  if (GMode == 0) {
     // fix data size and map type
     uint64_t CSize = 0;
     uint64_t RSize = 0;
@@ -963,11 +1019,18 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
         new_arg_types[idx] &= ~0x3ff;
         new_arg_types[idx] |= lr.Entry->MapType & 0x3ff;
       }
+      // lld: insert to cluster
+      if (lr.Entry != Device.HostDataToTargetMap.end() &&
+          Device.CurrentCluster) {
+        lr.Entry->Clusters.push_front(Device.CurrentCluster);
+        Device.CurrentCluster->Members.push_front(&*(lr.Entry));
+      }
       // restore size
       new_arg_sizes[idx] = DataSize;
       HostDataToTargetTy *HT = (lr.Entry != Device.HostDataToTargetMap.end() ? &(*lr.Entry) : NULL);
-      if (lr.Entry != Device.HostDataToTargetMap.end() && lr.Entry->IsValid &&
-          (getMemMapType(lr.Entry->MapType) <= MEM_MAPTYPE_UVM))
+      if (HT && getMemMapType(HT->MapType) != MEM_MAPTYPE_PART)
+        lr.Entry->Irreplaceable = true;
+      if (HT && HT->IsValid && (getMemMapType(HT->MapType) <= MEM_MAPTYPE_UVM))
         continue;
       int64_t AvailSize = total_dev_size - used_dev_size - Device.deviceSize - Device.umSize;
       assert(AvailSize > -1024); // reserve space for non UM variables
@@ -990,6 +1053,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
         AvailSize += partial_HT->DevSize;
       replaceDataObjPart(Device, partial_HT, partial_idx, new_arg_types[partial_idx], new_arg_sizes[partial_idx], AvailSize, args_base[partial_idx], ltc, data_region);
     }
+    cleanReplaceMetadata(Device);
   }
   return std::make_pair(new_arg_types, new_arg_sizes);
 }

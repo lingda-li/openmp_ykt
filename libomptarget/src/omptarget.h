@@ -19,7 +19,8 @@
 #include <stddef.h>
 
 // lld: debug print
-#define LLD_DEBUG
+//#define LLD_DEBUG
+//#define LLD_VERBOSE
 #ifdef LLD_DEBUG
 #include <stdio.h>
 #define LLD_DP(...)                                                    \
@@ -84,6 +85,8 @@ enum tgt_map_type {
   OMP_TGT_MAPTYPE_SDEV            = 0x200000000,
   // lld: partial map
   OMP_TGT_MAPTYPE_PART            = 0x400000000,
+  // lld: reuse distance
+  OMP_TGT_MAPTYPE_DIST            = 0x3f0000000000,
   // member of struct, member given by 4 MSBs - 1
   OMP_TGT_MAPTYPE_MEMBER_OF       = 0xffff000000000000
 };
