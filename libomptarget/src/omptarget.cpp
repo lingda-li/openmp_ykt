@@ -87,6 +87,7 @@ struct HostDataToTargetTy {
   bool Decided = true;
   int64_t MapType = 0;
   // lld: replacement info
+  double Locality = 0.0;
   int64_t Reuse = 0;
   uint64_t TimeStamp = 0;
   bool IsValid = true;
@@ -374,6 +375,9 @@ void RTLsTy::LoadRTLs() {
     if (!strcmp(envStr, "OBJ")) {
       GMode = -1;
       LLD_DP("Set mode to OBJ\n");
+    } else if (!strcmp(envStr, "LOCAL")) {
+      GMode = -2;
+      LLD_DP("Set mode to LOCAL\n");
     } else if (!strcmp(envStr, "UM")) {
       GMode = 1;
       LLD_DP("Set mode to UM\n");
