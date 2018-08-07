@@ -1,6 +1,5 @@
 // lld: utilities for replacement
 
-#define REUSE_DIST_CENTRIC
 #define NO_ON_DEMAND
 
 /// Data object cluster
@@ -184,21 +183,15 @@ int64_t releaseDataObj(DeviceTy &Device, HostDataToTargetTy *E) {
 }
 
 int64_t replaceDataObjPart(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, int64_t &MapType, int64_t Size, int64_t AvailSize, void *Base, uint64_t LTC, bool data_region) {
-#ifdef REUSE_DIST_CENTRIC
   uint64_t ReuseDist = getReuseDist(MapType);
-#else
   int64_t Reuse = getGlobalReuse(MapType);
-#endif
   std::vector<HostDataToTargetTy*> ReplaceList;
   for (auto &HT : Device.HostDataToTargetMap) {
     // find objects with poorer locality
     mem_map_type PreMap = getMemMapType(HT.MapType);
     if ((GMode == -2 && PreMap < MEM_MAPTYPE_PART) ||
-#ifdef REUSE_DIST_CENTRIC
-       (HT.ReuseDist + HT.TimeStamp > GlobalTimeStamp + ReuseDist && PreMap == MEM_MAPTYPE_PART && Entry != &HT)) {
-#else
-       (HT.Reuse > Reuse && PreMap == MEM_MAPTYPE_PART)) {
-#endif
+        (GMode == -3 && (HT.ReuseDist + HT.TimeStamp > GlobalTimeStamp + ReuseDist && PreMap == MEM_MAPTYPE_PART && Entry != &HT)) ||
+        (GMode >= -1 && (HT.Reuse > Reuse && PreMap == MEM_MAPTYPE_PART))) {
       int64_t HTSize = HT.DevSize;
       if (!HT.IsDeleted && HTSize >= 4096) { // Do not replace small objects
         AvailSize += HTSize;
@@ -251,24 +244,32 @@ int64_t replaceDataObjPart(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t 
 bool compareCandidates(HostDataToTargetTy *A, HostDataToTargetTy *B) {
   if (GMode == -2) {
     return (A->Locality < B->Locality);
-  }
-#ifdef REUSE_DIST_CENTRIC
-  uint64_t AR = A->ReuseDist + A->TimeStamp;
-  uint64_t BR = B->ReuseDist + B->TimeStamp;
-  return (AR == BR) ? (A->Reuse > B->Reuse) : (AR > BR);
-#else
-  return (A->Reuse > B->Reuse);
-#endif
+  } else if (GMode == -3) {
+    uint64_t AR = A->ReuseDist + A->TimeStamp;
+    uint64_t BR = B->ReuseDist + B->TimeStamp;
+    return (AR == BR) ? (A->Reuse > B->Reuse) : (AR > BR);
+  } else
+    return (A->Reuse > B->Reuse);
 }
+
+/*
+bool comparePriority(int64_t MapType, HostDataToTargetTy *R) {
+  if (GMode == -2) {
+    return (A->Locality < B->Locality);
+  } else if (GMode == -3) {
+    uint64_t AR = A->ReuseDist + A->TimeStamp;
+    uint64_t BR = B->ReuseDist + B->TimeStamp;
+    return (AR == BR) ? (A->Reuse > B->Reuse) : (AR > BR);
+  } else
+    return (A->Reuse > B->Reuse);
+}
+*/
 
 // replace a data object
 int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx, int64_t &MapType, int64_t Size, int64_t AvailSize, void *Base, uint64_t LTC, bool data_region) {
   int64_t OriAvailSize = AvailSize;
-#ifdef REUSE_DIST_CENTRIC
   uint64_t ReuseDist = getReuseDist(MapType);
-#else
   int64_t Reuse = getGlobalReuse(MapType);
-#endif
   std::vector<HostDataToTargetTy*> ReplaceList;
   for (auto &HT : Device.HostDataToTargetMap) {
     // if it is not replaceable
@@ -280,11 +281,8 @@ int64_t replaceDataObj(DeviceTy &Device, HostDataToTargetTy *Entry, int32_t idx,
     // find objects with poorer locality
     mem_map_type PreMap = getMemMapType(HT.MapType);
     if ((GMode == -2 && PreMap < MEM_MAPTYPE_PART) ||
-#ifdef REUSE_DIST_CENTRIC
-        (HT.ReuseDist + HT.TimeStamp > GlobalTimeStamp + ReuseDist && PreMap < MEM_MAPTYPE_PART) || 
-#else
-        (HT.Reuse > Reuse && PreMap < MEM_MAPTYPE_PART) ||
-#endif
+        (GMode == -3 && (HT.ReuseDist + HT.TimeStamp > GlobalTimeStamp + ReuseDist && PreMap < MEM_MAPTYPE_PART)) || 
+        (GMode >= -1 && (HT.Reuse > Reuse && PreMap < MEM_MAPTYPE_PART)) ||
         (PreMap == MEM_MAPTYPE_PART && Entry != &HT)) { // implicitly assume at most 1 is mapped to part
       int64_t HTSize;
       if (PreMap == MEM_MAPTYPE_PART)
@@ -877,16 +875,16 @@ bool rankArgs(std::pair<int32_t, int64_t> A, std::pair<int32_t, int64_t> B, Devi
     double AL = (double)getLocalReuse(A.second) * Device.loopTripCnt / arg_sizes[A.first];
     double BL = (double)getLocalReuse(B.second) * Device.loopTripCnt / arg_sizes[B.first];
     return (AL > BL);
+  } else {
+    int64_t AG = getGlobalReuse(A.second);
+    int64_t BG = getGlobalReuse(B.second);
+    if (GMode == -3) {
+      int64_t ARD = getReuseDist(A.second);
+      int64_t BRD = getReuseDist(B.second);
+      return (ARD == BRD) ? (AG < BG) : (ARD < BRD);
+    } else
+      return (AG < BG);
   }
-  int64_t AG = getGlobalReuse(A.second);
-  int64_t BG = getGlobalReuse(B.second);
-#ifdef REUSE_DIST_CENTRIC
-  int64_t ARD = getReuseDist(A.second);
-  int64_t BRD = getReuseDist(B.second);
-  return (ARD == BRD) ? (AG < BG) : (ARD < BRD);
-#else
-  return (AG < BG);
-#endif
 }
 
 // lld: decide mapping based on rank
@@ -1016,7 +1014,7 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
         new_arg_types[idx] |= OMP_TGT_MAPTYPE_HOST;
       }
     }
-  } else { // object or local
+  } else { // global or local
     // argument index for partial mapping
     int32_t partial_idx = -1;
     HostDataToTargetTy *partial_HT;
@@ -1037,7 +1035,8 @@ std::pair<int64_t*, int64_t*> target_uvm_data_mapping_opt(DeviceTy &Device, void
       assert(AvailSize > -1024); // reserve space for non UM variables
       if (HT && getMemMapType(HT->MapType) == MEM_MAPTYPE_PART)
         AvailSize += HT->DevSize;
-      if (GMode == -2 && data_region)
+      //if (GMode <= -2 && data_region) // in reuse distance and local management, do not map in target data region
+      if (data_region)
         placeDataObj(Device, HT, idx, new_arg_types[idx], DataSize, args_base[idx], ltc, data_region);
       else if (DataSize <= AvailSize)
         used_dev_size += placeDataObj(Device, HT, idx, new_arg_types[idx], DataSize, args_base[idx], ltc, data_region);

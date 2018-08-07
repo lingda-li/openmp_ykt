@@ -374,10 +374,13 @@ void RTLsTy::LoadRTLs() {
   if (envStr) {
     if (!strcmp(envStr, "OBJ")) {
       GMode = -1;
-      LLD_DP("Set mode to OBJ\n");
+      LLD_DP("Set mode to GLOBAL\n");
     } else if (!strcmp(envStr, "LOCAL")) {
       GMode = -2;
       LLD_DP("Set mode to LOCAL\n");
+    } else if (!strcmp(envStr, "RD")) {
+      GMode = -3;
+      LLD_DP("Set mode to RD\n");
     } else if (!strcmp(envStr, "UM")) {
       GMode = 1;
       LLD_DP("Set mode to UM\n");
@@ -393,7 +396,8 @@ void RTLsTy::LoadRTLs() {
     } else if (!strcmp(envStr, "SDEV")) {
       GMode = 5;
       LLD_DP("Set mode to SDEV\n");
-    }
+    } else
+      LLD_DP("Default mode is CLUSTER\n");
   }
   envStr = getenv("LLD_RECYCLE");
   if (envStr) {
