@@ -19,8 +19,8 @@
 #include <stddef.h>
 
 // lld: debug print
-#define LLD_DEBUG
-#define LLD_VERBOSE
+//#define LLD_DEBUG
+//#define LLD_VERBOSE
 #ifdef LLD_DEBUG
 #include <stdio.h>
 #define LLD_DP(...)                                                    \
